@@ -18,6 +18,7 @@
 
 #include <tt-metalium/program_descriptors.hpp>
 #include "../gated_rms/device/kda_gated_rms_device_operation.hpp"
+#include "../causal_convolution/device/kda_causal_conv_device_operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 
@@ -239,55 +240,6 @@ std::pair<Tensor, Tensor> kda_affine_compose(
     const Tensor& transform_a,
     const Tensor& transform_b,
     uint32_t groups_per_head,
-    const tt::tt_metal::MemoryConfig& output_mem_config,
-    const DeviceComputeKernelConfig& compute_kernel_config);
-
-struct KdaCausalConvParams {
-    uint32_t sequence;
-    uint32_t q_width;
-    uint32_t k_width;
-    uint32_t v_width;
-    tt::tt_metal::MemoryConfig output_mem_config;
-    DeviceComputeKernelConfig compute_kernel_config;
-};
-
-struct KdaCausalConvInputs {
-    Tensor input;
-    Tensor state;
-    Tensor tap0;
-    Tensor tap1;
-    Tensor tap2;
-    Tensor tap3;
-};
-
-struct KdaCausalConvProgramFactory {
-    static tt::tt_metal::ProgramDescriptor create_descriptor(
-        const KdaCausalConvParams&, const KdaCausalConvInputs&, std::vector<Tensor>&);
-};
-
-struct KdaCausalConvOperation {
-    using operation_attributes_t = KdaCausalConvParams;
-    using tensor_args_t = KdaCausalConvInputs;
-    using spec_return_value_t = std::vector<tt::tt_metal::TensorSpec>;
-    using tensor_return_value_t = std::vector<Tensor>;
-    using program_factory_t = std::variant<KdaCausalConvProgramFactory>;
-
-    static program_factory_t select_program_factory(const operation_attributes_t&, const tensor_args_t&);
-    static void validate_on_program_cache_miss(const operation_attributes_t&, const tensor_args_t&);
-    static spec_return_value_t compute_output_specs(const operation_attributes_t&, const tensor_args_t&);
-    static tensor_return_value_t create_output_tensors(const operation_attributes_t&, const tensor_args_t&);
-};
-
-std::vector<Tensor> kda_causal_conv1d_split(
-    const Tensor& input,
-    const Tensor& state,
-    const Tensor& tap0,
-    const Tensor& tap1,
-    const Tensor& tap2,
-    const Tensor& tap3,
-    uint32_t q_width,
-    uint32_t k_width,
-    uint32_t v_width,
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const DeviceComputeKernelConfig& compute_kernel_config);
 

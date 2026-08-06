@@ -89,26 +89,6 @@ void bind_kda(nb::module_& mod) {
         nb::kw_only(),
         nb::arg("sequence_parallel_axis"),
         nb::arg("memory_config") = nb::none());
-
-    ttnn::bind_function<"kda_causal_conv1d_split", "ttnn.transformer.">(
-        mod,
-        R"doc(
-        Batch-one, four-tap causal convolution. Input and state are token-major channel tensors;
-        q_width, k_width, and v_width partition the channel dimension into direct tiled Q/K/V outputs.
-        )doc",
-        &ttnn::transformer::kda_causal_conv1d_split,
-        nb::arg("input").noconvert(),
-        nb::arg("state").noconvert(),
-        nb::arg("tap0").noconvert(),
-        nb::arg("tap1").noconvert(),
-        nb::arg("tap2").noconvert(),
-        nb::arg("tap3").noconvert(),
-        nb::arg("q_width"),
-        nb::arg("k_width"),
-        nb::arg("v_width"),
-        nb::kw_only(),
-        nb::arg("memory_config") = nb::none(),
-        nb::arg("compute_kernel_config") = nb::none());
 }
 
 }  // namespace ttnn::operations::transformer

@@ -18,6 +18,7 @@
 #include "chunk_gated_delta_rule/chunk_gated_delta_rule_nanobind.hpp"
 #include "kda/kda_nanobind.hpp"
 #include "kda/gated_rms/kda_gated_rms_nanobind.hpp"
+#include "kda/causal_convolution/kda_causal_conv_nanobind.hpp"
 #include "sdpa/sdpa_nanobind.hpp"
 #include "sdpa_config.hpp"
 #include "sdpa_decode/sdpa_decode_nanobind.hpp"
@@ -81,6 +82,7 @@ void py_module(nb::module_& mod) {
     bind_chunk_gated_delta_rule(mod);
     bind_kda(mod);
     bind_kda_gated_rms(mod);
+    bind_kda_causal_conv(mod);
 }
 
 }  // namespace ttnn::operations::transformer
