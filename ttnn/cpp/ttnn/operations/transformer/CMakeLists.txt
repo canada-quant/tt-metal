@@ -1,4 +1,5 @@
 include(sources.cmake)
+include(kda/gated_rms/sources.cmake)
 
 add_library(ttnn_op_transformer ${LIB_TYPE})
 add_library(TTNN::Ops::Transformer ALIAS ttnn_op_transformer)
