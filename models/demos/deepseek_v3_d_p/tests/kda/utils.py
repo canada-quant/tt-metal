@@ -300,6 +300,11 @@ def make_kimi_k3_device_case(
 ) -> tuple[ttKDA, ttnn.Tensor]:
     """Construct the real-weight layer and sequence-parallel device input."""
     sequence_parallel_axis = 1 - tensor_parallel_axis
+    tensor_cache_path = kimi_k3_tensor_cache_path(
+        case.checkpoint_dir,
+        mesh_device,
+        tensor_parallel_axis,
+    )
     mesh_dims: list[int | None] = [None, None]
     mesh_dims[sequence_parallel_axis] = 1
     hidden = ttnn.from_torch(
@@ -343,7 +348,7 @@ def make_kimi_k3_device_case(
         mesh_device,
         case.config,
         case.state_dict if weights is None else None,
-        weight_cache_path=case.checkpoint_dir / "ttnn_cache",
+        weight_cache_path=tensor_cache_path,
         layer_idx=KimiK3Config.FIRST_KDA_LAYER,
         weights=weights,
         tt_ccl=TT_CCL(mesh_device),
@@ -353,6 +358,18 @@ def make_kimi_k3_device_case(
         program_config=program_config or default_program_config,
     )
     return layer, hidden
+
+
+def kimi_k3_tensor_cache_path(
+    checkpoint_dir: Path,
+    mesh_device: ttnn.MeshDevice,
+    tensor_parallel_axis: int,
+) -> Path:
+    """Select the parent-owned cache root for one mesh placement."""
+    mesh_shape = tuple(mesh_device.shape)
+    sequence_parallel_axis = 1 - tensor_parallel_axis
+    layout = f"sp{mesh_shape[sequence_parallel_axis]}_tp{mesh_shape[tensor_parallel_axis]}"
+    return checkpoint_dir / "ttnn_cache" / layout
 
 
 def run_profiled_forward(

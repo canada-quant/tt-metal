@@ -177,6 +177,11 @@ def _allocate_state(layer: ttKDA) -> KdaState:
     return layer.allocate_state(batch_size=1)
 
 
+def _deallocate_state(state: KdaState) -> None:
+    ttnn.deallocate(state.recurrent)
+    ttnn.deallocate(state.convolution)
+
+
 def _trace_wall_ms(
     mesh_device: ttnn.MeshDevice,
     layer: ttKDA,
@@ -184,12 +189,12 @@ def _trace_wall_ms(
     repetitions: int,
 ) -> float:
     state = _allocate_state(layer)
-    warm_output, _ = layer.forward(hidden, state)
+    warm_output, warm_state = layer.forward(hidden, state)
     ttnn.synchronize_device(mesh_device)
     ttnn.deallocate(warm_output)
-    state = _allocate_state(layer)
+    _deallocate_state(warm_state)
     trace_id = ttnn.begin_trace_capture(mesh_device, cq_id=0)
-    output, _ = layer.forward(hidden, state)
+    output, next_state = layer.forward(hidden, state)
     ttnn.end_trace_capture(mesh_device, trace_id, cq_id=0)
     ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
     ttnn.synchronize_device(mesh_device)
@@ -200,6 +205,8 @@ def _trace_wall_ms(
     elapsed = time.perf_counter() - start
     ttnn.release_trace(mesh_device, trace_id)
     ttnn.deallocate(output)
+    _deallocate_state(state)
+    _deallocate_state(next_state)
     return elapsed * 1e3 / repetitions
 
 
@@ -219,7 +226,11 @@ def test_kimi_k3_layer_1_perf(
     assert sequence == _SEQUENCE, "the cached CPU oracle covers only the production sequence"
     case, golden_output, golden_state, cpu_reference_seconds = kimi_k3_production_reference
     sequence_parallel_axis = 1 - tensor_parallel_axis
-    layer, hidden_tt = make_kimi_k3_device_case(mesh_device, case, tp_axis=tensor_parallel_axis)
+    layer, hidden_tt = make_kimi_k3_device_case(
+        mesh_device,
+        case,
+        tensor_parallel_axis=tensor_parallel_axis,
+    )
 
     state = _allocate_state(layer)
     start = time.perf_counter()
@@ -243,6 +254,7 @@ def test_kimi_k3_layer_1_perf(
         )
     finally:
         ttnn.deallocate(output)
+    _deallocate_state(state)
 
     repetitions = int(os.getenv("PERF_REPS", str(_REPETITIONS)))
     wall_ms = _trace_wall_ms(mesh_device, layer, hidden_tt, repetitions)

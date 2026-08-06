@@ -131,7 +131,7 @@ class ttKDA:
         tt_ccl: TT_CCL | None = None,
         sp_axis: int = 0,
         tp_axis: int = 1,
-        topology: ttnn.Topology = ttnn.Topology.Linear,
+        topology: ttnn.Topology | None = None,
         program_config: KDAProgramConfig | None = None,
         summary_group_chunks: int | None = None,
         weights: KDAWeights | None = None,
@@ -155,7 +155,11 @@ class ttKDA:
         output_grid = mesh_device.compute_with_storage_grid_size()
         self.output_projection_grid = (output_grid.x, output_grid.y)
         self.recurrent_state_dtype = program_config.recurrent_state_dtype
-        self.tp_ccl_topology = topology
+        self.tp_ccl_topology = (
+            topology
+            if topology is not None
+            else (ttnn.Topology.Ring if self.sequence_parallel_size == 1 else ttnn.Topology.Linear)
+        )
         self.affine_summary_dtype = program_config.affine_summary_dtype
         self.grouped_scan_output_dtype = program_config.grouped_scan_output_dtype
         self.use_bf16_prep_intermediates = program_config.use_bf16_prep_intermediates
