@@ -18,9 +18,10 @@ void kernel_main() {
     constexpr uint32_t Vt = get_compile_time_arg_val(2);  // per-core V-block width (tiles)
     constexpr uint32_t has_s0 = get_compile_time_arg_val(3);
     constexpr uint32_t Vt_full = get_compile_time_arg_val(4);  // full V (tiles) for row stride
+    constexpr bool summary_pair = get_compile_time_arg_val(6) == 1;
     (void)has_s0;
 
-    constexpr auto o_a = TensorAccessorArgs<5>();
+    constexpr auto o_a = TensorAccessorArgs<7>();
     constexpr auto fs_a = TensorAccessorArgs<o_a.next_compile_time_args_offset()>();
 
     const uint32_t h = get_arg_val<uint32_t>(0);
@@ -41,6 +42,36 @@ void kernel_main() {
 
     Noc noc;
     CircularBuffer cbout(cb_out);
+
+    if constexpr (summary_pair) {
+        // The summary scan emits one A+B state in cb_out and one B state in cb_final,
+        // each [K, V]. Unlike the normal token path, there are no NC output slabs.
+        cbout.wait_front(kv);
+        const uint32_t row_base = h * Kt * Vt_full;
+        auto src = use<CircularBuffer::AddrSelector::READ_PTR>(cbout);
+        for (uint32_t r = 0; r < Kt; r++) {
+            const uint32_t dst = row_base + r * Vt_full + vb * Vt;
+            for (uint32_t vt = 0; vt < Vt; vt++) {
+                noc.async_write(src, o_acc, tb_o, {.offset_bytes = (r * Vt + vt) * tb_o}, {.page_id = dst + vt});
+            }
+        }
+        noc.async_write_barrier();
+        cbout.pop_front(kv);
+
+        CircularBuffer cbfs(cb_final);
+        cbfs.wait_front(kv);
+        auto final_src = use<CircularBuffer::AddrSelector::READ_PTR>(cbfs);
+        for (uint32_t r = 0; r < Kt; r++) {
+            const uint32_t dst = row_base + r * Vt_full + vb * Vt;
+            for (uint32_t vt = 0; vt < Vt; vt++) {
+                noc.async_write(
+                    final_src, fs_acc, tb_fs, {.offset_bytes = (r * Vt + vt) * tb_fs}, {.page_id = dst + vt});
+            }
+        }
+        noc.async_write_barrier();
+        cbfs.pop_front(kv);
+        return;
+    }
 
     // o [BH, NC, C, V]: scatter this V-block back — row stride Vt_full, column offset vb*Vt.
     for (uint32_t c = 0; c < NC; c++) {
