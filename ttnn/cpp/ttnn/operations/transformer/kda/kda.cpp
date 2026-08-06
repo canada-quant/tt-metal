@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "device/kda_phased.hpp"
+#include "chunk_preparation/device/kda_chunk_preparation_device_operation.hpp"
 
 #include "ttnn/operations/ccl/all_gather/all_gather.hpp"
 #include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
@@ -356,7 +357,7 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
     // Keep memory selection stable across warmup and trace capture. L1 is used only when the
     // geometry fits the device's fixed allocatable budget; distributed summaries stay in DRAM.
     const auto prep_mem = distributed_prefix || !prep_fits_l1 ? ttnn::DRAM_MEMORY_CONFIG : ttnn::L1_MEMORY_CONFIG;
-    auto prep = ttnn::prim::kda_chunk_prep(
+    auto prep = ttnn::prim::kda_chunk_preparation(
         q,
         k,
         v,
@@ -376,7 +377,6 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
         flat_qk,
         H,
         flat_g,
-        true,
         prep_bf16_mask);
     std::optional<std::vector<ttnn::Tensor>> grouped_scan;
     std::optional<ttnn::Tensor> distributed_final_state;
