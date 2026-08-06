@@ -556,6 +556,7 @@ tt::tt_metal::ProgramDescriptor KdaFinalScanProgramFactory::create_descriptor(
 // ---------------------------------------------------------------------------
 // KDA GROUPED AFFINE PREFIX
 // ---------------------------------------------------------------------------
+#if 0  // Superseded by fixed-purpose affine prefix and composition leaves.
 tt::tt_metal::ProgramDescriptor KdaAffinePrefixProgramFactory::create_descriptor(
     const KdaAffinePrefixParams& attrs, const KdaAffinePrefixInputs& in, std::vector<Tensor>& outputs) {
     const uint32_t Kt = attrs.key_dim / TILE_WIDTH;
@@ -671,4 +672,5 @@ tt::tt_metal::ProgramDescriptor KdaAffinePrefixProgramFactory::create_descriptor
     return desc;
 }
 
+#endif
 }  // namespace ttnn::prim

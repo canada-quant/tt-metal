@@ -299,6 +299,7 @@ std::vector<Tensor> kda_final_scan(
 // ---------------------------------------------------------------------------
 // KDA GROUPED AFFINE PREFIX
 // ---------------------------------------------------------------------------
+#if 0  // Superseded by fixed-purpose affine prefix and composition leaves.
 KdaAffinePrefixOperation::program_factory_t KdaAffinePrefixOperation::select_program_factory(
     const operation_attributes_t&, const tensor_args_t&) {
     return KdaAffinePrefixProgramFactory{};
@@ -412,4 +413,5 @@ std::pair<Tensor, Tensor> kda_affine_compose(
     return {results[0], results[1]};
 }
 
+#endif
 }  // namespace ttnn::prim

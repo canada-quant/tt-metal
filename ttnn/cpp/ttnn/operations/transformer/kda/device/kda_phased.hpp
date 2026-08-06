@@ -18,6 +18,8 @@
 
 #include <tt-metalium/program_descriptors.hpp>
 #include "../gated_rms/device/kda_gated_rms_device_operation.hpp"
+#include "../affine_composition/device/kda_affine_composition_device_operation.hpp"
+#include "../affine_prefix/device/kda_affine_prefix_device_operation.hpp"
 #include "../causal_convolution/device/kda_causal_conv_device_operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
@@ -194,7 +196,8 @@ std::vector<Tensor> kda_final_scan(
 // ---------------------------------------------------------------------------
 // KDA GROUPED AFFINE PREFIX
 // ---------------------------------------------------------------------------
-struct KdaAffinePrefixParams {
+// Superseded by fixed-purpose affine leaf headers above.
+#if 0
     uint32_t BH;
     uint32_t groups_per_head;
     uint32_t key_dim;
@@ -243,4 +246,5 @@ std::pair<Tensor, Tensor> kda_affine_compose(
     const tt::tt_metal::MemoryConfig& output_mem_config,
     const DeviceComputeKernelConfig& compute_kernel_config);
 
+#endif
 }  // namespace ttnn::prim
