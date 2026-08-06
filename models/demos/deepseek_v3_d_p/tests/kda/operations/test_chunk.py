@@ -11,6 +11,7 @@ import ttnn
 from models.common.utility_functions import run_for_blackhole
 from models.demos.deepseek_v3_d_p.reference.kda.ops import kda_recurrent_reference, l2_norm_reference
 from models.demos.deepseek_v3_d_p.tests.kda.utils import assert_accurate, assert_bit_identical, compare_cpu_device
+from models.demos.deepseek_v3_d_p.tt.kda import ops
 
 pytestmark = [
     run_for_blackhole(),
@@ -97,7 +98,7 @@ def test_chunk_kda_pcc(
         else None
     )
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        output_tt, final_state_tt = ttnn.transformer.chunk_kda(
+        output_tt, final_state_tt = ops.chunk_recurrence(
             q_tt,
             k_tt,
             v_tt,
@@ -167,7 +168,7 @@ def test_grouped_summary_preserves_weak_decay(device: ttnn.Device, production_tu
     }
 
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        output_tt, final_state_tt = ttnn.transformer.chunk_kda(
+        output_tt, final_state_tt = ops.chunk_recurrence(
             _to_device(l2_norm_reference(q), device, ttnn.bfloat16),
             _to_device(l2_norm_reference(k), device, ttnn.bfloat16),
             _to_device(v, device, ttnn.bfloat16),
@@ -184,7 +185,7 @@ def test_grouped_summary_preserves_weak_decay(device: ttnn.Device, production_tu
     ttnn.synchronize_device(device)
 
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        output_two_tt, final_state_two_tt = ttnn.transformer.chunk_kda(
+        output_two_tt, final_state_two_tt = ops.chunk_recurrence(
             _to_device(l2_norm_reference(q), device, ttnn.bfloat16),
             _to_device(l2_norm_reference(k), device, ttnn.bfloat16),
             _to_device(v, device, ttnn.bfloat16),
@@ -229,7 +230,7 @@ def test_chunk_kda_determinism(device: ttnn.Device) -> None:
     results = []
     for _ in range(3):
         with ttnn.manage_config("throw_exception_on_fallback", True):
-            output_tt, final_state_tt = ttnn.transformer.chunk_kda(
+            output_tt, final_state_tt = ops.chunk_recurrence(
                 q_tt,
                 k_tt,
                 v_tt,

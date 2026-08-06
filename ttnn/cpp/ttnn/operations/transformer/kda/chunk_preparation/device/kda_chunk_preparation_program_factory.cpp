@@ -52,8 +52,9 @@ constexpr uint32_t scratch_two = tt::CBIndex::c_29;
 constexpr uint32_t scratch_three = tt::CBIndex::c_30;
 constexpr uint32_t state_three = tt::CBIndex::c_31;
 }  // namespace prep_cb
+}  // namespace
 
-uint32_t expected_cb_size_bytes(
+uint32_t kda_chunk_preparation_cb_size_bytes(
     uint32_t chunk_size, uint32_t key_dim, uint32_t value_dim, DataType gate_dtype, uint32_t output_bf16_mask) {
     const uint32_t Ct = chunk_size / TILE_HEIGHT;
     const uint32_t Kt = key_dim / TILE_WIDTH;
@@ -106,7 +107,8 @@ uint32_t expected_cb_size_bytes(
     add(kv, 2);
     return bytes;
 }
-}  // namespace
+
+namespace {}  // namespace
 
 ProgramDescriptor KdaChunkPreparationProgramFactory::create_descriptor(
     const KdaChunkPreparationParams& attrs, const KdaChunkPreparationInputs& in, std::vector<Tensor>& outputs) {
@@ -176,7 +178,7 @@ ProgramDescriptor KdaChunkPreparationProgramFactory::create_descriptor(
     add_cb(prep_cb::scratch_three, scratch);
     add_cb(prep_cb::state_three, kv, 2);
     TT_FATAL(
-        cb_size_bytes == expected_cb_size_bytes(
+        cb_size_bytes == kda_chunk_preparation_cb_size_bytes(
                              attrs.chunk_size, attrs.key_dim, attrs.value_dim, in.g.dtype(), attrs.output_bf16_mask),
         "KDA prep CB size estimator is out of sync with its program factory");
 
