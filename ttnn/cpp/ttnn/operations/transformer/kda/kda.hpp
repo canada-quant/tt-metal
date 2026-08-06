@@ -4,6 +4,8 @@
 #pragma once
 
 #include <optional>
+
+#include "gated_rms/kda_gated_rms.hpp"
 #include <tuple>
 
 #include "ttnn/tensor/tensor.hpp"
@@ -69,17 +71,6 @@ std::tuple<ttnn::Tensor, ttnn::Tensor> kda_convolution_halo(
     const ttnn::Tensor& initial_carry,
     uint32_t sequence_parallel_axis,
     const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt);
-
-/** Fused per-head RMSNorm and sigmoid gate for tile-aligned KDA prefill. */
-ttnn::Tensor kda_gated_rms_norm(
-    const ttnn::Tensor& input,
-    const ttnn::Tensor& gate,
-    const ttnn::Tensor& weight,
-    uint32_t num_heads,
-    float epsilon = 1e-5f,
-    const std::optional<ttnn::MemoryConfig>& memory_config = std::nullopt,
-    const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt,
-    ttnn::DataType output_dtype = ttnn::DataType::FLOAT32);
 
 /** Batch-one, four-tap KDA convolution with direct tiled Q/K/V outputs. */
 std::tuple<ttnn::Tensor, ttnn::Tensor, ttnn::Tensor> kda_causal_conv1d_split(

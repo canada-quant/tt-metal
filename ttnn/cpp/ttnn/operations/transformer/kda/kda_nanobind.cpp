@@ -90,23 +90,6 @@ void bind_kda(nb::module_& mod) {
         nb::arg("sequence_parallel_axis"),
         nb::arg("memory_config") = nb::none());
 
-    ttnn::bind_function<"kda_gated_rms_norm", "ttnn.transformer.">(
-        mod,
-        R"doc(
-        Fused per-head RMSNorm and sigmoid gate for tile-aligned KDA prefill.
-        Input [B*H,T,V], gate [B,T,H*V], and weight [V] produce [B,T,H*V].
-        )doc",
-        &ttnn::transformer::kda_gated_rms_norm,
-        nb::arg("input").noconvert(),
-        nb::arg("gate").noconvert(),
-        nb::arg("weight").noconvert(),
-        nb::arg("num_heads"),
-        nb::kw_only(),
-        nb::arg("epsilon") = 1e-5f,
-        nb::arg("memory_config") = nb::none(),
-        nb::arg("compute_kernel_config") = nb::none(),
-        nb::arg("output_dtype") = ttnn::DataType::FLOAT32);
-
     ttnn::bind_function<"kda_causal_conv1d_split", "ttnn.transformer.">(
         mod,
         R"doc(

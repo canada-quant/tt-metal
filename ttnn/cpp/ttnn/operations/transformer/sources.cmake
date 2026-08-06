@@ -38,6 +38,7 @@ set(TTNN_OP_TRANSFORMER_SRCS
     chunk_gated_delta_rule/chunk_gated_delta_rule.cpp
     kda/device/kda_phased.cpp
     kda/device/kda_phased_program_factory.cpp
+    kda/device/kda_factory_utils.cpp
     kda/kda.cpp
 )
 

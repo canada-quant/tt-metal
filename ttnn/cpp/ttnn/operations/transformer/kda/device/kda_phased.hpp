@@ -17,7 +17,7 @@
 #include <vector>
 
 #include <tt-metalium/program_descriptors.hpp>
-#include "../gated_rms/device/kda_gated_rms_device_operation_types.hpp"
+#include "../gated_rms/device/kda_gated_rms_device_operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 

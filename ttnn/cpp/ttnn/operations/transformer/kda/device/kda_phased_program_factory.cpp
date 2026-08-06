@@ -11,6 +11,7 @@
 //         (inherently sequential — the recurrence forbids chunk-parallelism here).
 
 #include "kda_phased.hpp"
+#include "kda_factory_utils.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -68,61 +69,6 @@ constexpr uint32_t dl = decayfac;  // scan reads dl into this slot
 }  // namespace kda_pcb
 
 namespace kda_factory_detail {
-
-ComputeConfigDescriptor kda_compute_cfg(
-    tt::ARCH arch, const DeviceComputeKernelConfig& config, bool honor_caller_config = true) {
-    if (!honor_caller_config) {
-        return ComputeConfigDescriptor{
-            .math_fidelity = MathFidelity::HiFi4, .fp32_dest_acc_en = true, .math_approx_mode = false};
-    }
-    const auto args = get_compute_kernel_config_args(arch, config);
-    return ComputeConfigDescriptor{
-        .math_fidelity = std::get<0>(args),
-        .fp32_dest_acc_en = std::get<2>(args),
-        .math_approx_mode = std::get<1>(args)};
-}
-
-// Chunk-parallel work distribution for PREP: split `total` independent (head, chunk) work-items
-// as evenly as possible across the compute grid. Work-item wi in [0,total) maps directly to the
-// flat DRAM tile index used by every prep tensor ([BH, NC, ...] => wi = h*NC + c), so a core that
-// is assigned a contiguous range [wi_start, wi_start+wi_count) reads/writes exactly those tiles —
-// the DRAM result is byte-identical no matter how items are partitioned. The first `rem` cores get
-// one extra item (ceil), the rest get floor; every used core gets >= 1 (since P <= total).
-struct KdaPrepWorkDist {
-    std::vector<CoreCoord> cores;  // used cores, in assignment order
-    std::vector<uint32_t> wi_start;
-    std::vector<uint32_t> wi_count;
-    CoreRangeSet core_set;  // all used cores (kernel placement + CB alloc)
-};
-
-// `core_cap` bounds how many cores we may use (defaults to the whole grid). Perf A/B only:
-// setting core_cap=BH reproduces the old "1 core/head, NC chunks serial" layout exactly (each
-// head's NC work-items are contiguous, wi in [h*NC, h*NC+NC)), using the identical kernels.
-KdaPrepWorkDist distribute_prep(CoreCoord grid, uint32_t total, uint32_t core_cap) {
-    const uint32_t max_cores = std::min<uint32_t>(grid.x * grid.y, core_cap);
-    const uint32_t P = std::min(total, max_cores);
-    TT_FATAL(P > 0, "prep work distribution needs >= 1 work-item (total={})", total);
-    const uint32_t base = total / P;
-    const uint32_t rem = total % P;  // first `rem` cores get base+1
-
-    KdaPrepWorkDist d;
-    d.cores.reserve(P);
-    d.wi_start.reserve(P);
-    d.wi_count.reserve(P);
-    std::set<CoreRange> crs;
-    uint32_t off = 0;
-    for (uint32_t i = 0; i < P; i++) {
-        const CoreCoord core{i % grid.x, i / grid.x};  // row-major over the grid
-        const uint32_t cnt = base + (i < rem ? 1u : 0u);
-        d.cores.push_back(core);
-        d.wi_start.push_back(off);
-        d.wi_count.push_back(cnt);
-        crs.insert(CoreRange{core, core});
-        off += cnt;
-    }
-    d.core_set = CoreRangeSet{crs};
-    return d;
-}
 
 // The scan factorizes over V. Preserve scalar GDN's established maximum splitting, while the measured
 // KDA crossover favors finest-grain splitting at <=8 local heads and one full-V core per head at >=16.
@@ -721,93 +667,6 @@ tt::tt_metal::ProgramDescriptor KdaAffinePrefixProgramFactory::create_descriptor
     }
 
     desc.kernels.push_back(std::move(dataflow));
-    desc.kernels.push_back(std::move(compute));
-    return desc;
-}
-
-tt::tt_metal::ProgramDescriptor KdaGatedRmsProgramFactory::create_descriptor(
-    const KdaGatedRmsParams& attrs, const KdaGatedRmsInputs& in, std::vector<Tensor>& outputs) {
-    const uint32_t Mt = attrs.sequence / TILE_HEIGHT;
-    const uint32_t Vt = attrs.value_dim / TILE_WIDTH;
-    const uint32_t total = attrs.batch * attrs.num_heads * Mt;
-    // Use the fewest workers that preserve the all-core maximum items/worker.
-    const auto grid = in.input.device()->compute_with_storage_grid_size();
-    const uint32_t max_items_per_core = tt::div_up(total, grid.x * grid.y);
-    const uint32_t rms_core_limit = tt::div_up(total, max_items_per_core);
-    auto dist =
-        kda_factory_detail::distribute_prep(in.input.device()->compute_with_storage_grid_size(), total, rms_core_limit);
-    const auto& cores = dist.core_set;
-
-    ProgramDescriptor desc;
-    auto add_cb = [&](uint32_t idx, uint32_t tiles, tt::DataFormat format, uint32_t buffers = 1) {
-        const uint32_t tile_size = tt::tile_size(format);
-        desc.cbs.push_back(CBDescriptor{
-            .total_size = tiles * buffers * tile_size,
-            .core_ranges = cores,
-            .format_descriptors = {{CBFormatDescriptor{
-                .buffer_index = static_cast<uint8_t>(idx), .data_format = format, .page_size = tile_size}}}});
-    };
-    add_cb(0, Vt, datatype_to_dataformat_converter(in.input.dtype()));
-    add_cb(1, Vt, tt::DataFormat::Float16_b);
-    add_cb(2, Vt, tt::DataFormat::Float16_b);
-    add_cb(3, Vt, tt::DataFormat::Float32);
-    add_cb(4, 1, tt::DataFormat::Float32);
-    add_cb(5, 1, tt::DataFormat::Float32);
-    add_cb(6, Vt, tt::DataFormat::Float32);
-    add_cb(7, Vt, datatype_to_dataformat_converter(attrs.output_dtype), 2);
-    add_cb(8, 1, tt::DataFormat::Float32);
-
-    uint32_t eps_bits = 0;
-    uint32_t inv_v_bits = 0;
-    const float inv_v = 1.0f / static_cast<float>(attrs.value_dim);
-    std::memcpy(&eps_bits, &attrs.epsilon, sizeof(float));
-    std::memcpy(&inv_v_bits, &inv_v, sizeof(float));
-
-    std::vector<uint32_t> reader_ct = {Vt, attrs.num_heads, Mt};
-    TensorAccessorArgs(*in.input.buffer()).append_to(reader_ct);
-    TensorAccessorArgs(*in.gate.buffer()).append_to(reader_ct);
-    TensorAccessorArgs(*in.weight.buffer()).append_to(reader_ct);
-    std::vector<uint32_t> writer_ct = {Vt, attrs.num_heads, Mt};
-    TensorAccessorArgs(*outputs[0].buffer()).append_to(writer_ct);
-
-    KernelDescriptor reader;
-    reader.kernel_source =
-        "ttnn/cpp/ttnn/operations/transformer/kda/gated_rms/device/kernels/dataflow/reader_kda_gated_rms.cpp";
-    reader.source_type = KernelDescriptor::SourceType::FILE_PATH;
-    reader.core_ranges = cores;
-    reader.compile_time_args = reader_ct;
-    reader.config = ReaderConfigDescriptor{};
-
-    KernelDescriptor writer;
-    writer.kernel_source =
-        "ttnn/cpp/ttnn/operations/transformer/kda/gated_rms/device/kernels/dataflow/writer_kda_gated_rms.cpp";
-    writer.source_type = KernelDescriptor::SourceType::FILE_PATH;
-    writer.core_ranges = cores;
-    writer.compile_time_args = writer_ct;
-    writer.config = WriterConfigDescriptor{};
-
-    KernelDescriptor compute;
-    compute.kernel_source =
-        "ttnn/cpp/ttnn/operations/transformer/kda/gated_rms/device/kernels/compute/kda_gated_rms.cpp";
-    compute.source_type = KernelDescriptor::SourceType::FILE_PATH;
-    compute.core_ranges = cores;
-    compute.compile_time_args = {Vt, eps_bits, inv_v_bits};
-    compute.config = kda_compute_cfg(in.input.device()->arch(), attrs.compute_kernel_config);
-
-    auto* input_buffer = in.input.buffer();
-    auto* gate_buffer = in.gate.buffer();
-    auto* weight_buffer = in.weight.buffer();
-    auto* output_buffer = outputs[0].buffer();
-    for (uint32_t i = 0; i < dist.cores.size(); i++) {
-        const auto& core = dist.cores[i];
-        reader.emplace_runtime_args(
-            core, {dist.wi_start[i], dist.wi_count[i], input_buffer, gate_buffer, weight_buffer});
-        writer.emplace_runtime_args(core, {dist.wi_start[i], dist.wi_count[i], output_buffer});
-        compute.emplace_runtime_args(core, {dist.wi_count[i]});
-    }
-
-    desc.kernels.push_back(std::move(reader));
-    desc.kernels.push_back(std::move(writer));
     desc.kernels.push_back(std::move(compute));
     return desc;
 }
