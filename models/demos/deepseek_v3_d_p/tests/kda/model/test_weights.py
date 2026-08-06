@@ -206,7 +206,7 @@ def test_2d_tp_weight_and_output_placement(
         mesh_device,
         config,
         state_dict,
-        tp_axis=tensor_parallel_axis,
+        tensor_parallel_axis=tensor_parallel_axis,
     )
     assert weights.tensor_parallel_size == tensor_parallel_size
 
@@ -238,6 +238,7 @@ def test_2d_tp_weight_and_output_placement(
         fp32_dest_acc_en=True,
         packer_l1_acc=True,
     )
+    output_grid = mesh_device.compute_with_storage_grid_size()
     value_tt = ttnn.reshape(value_tt, (1, 1, sequence, value_tt.shape[-1]))
     output = ttnn.linear(
         value_tt,
@@ -248,6 +249,7 @@ def test_2d_tp_weight_and_output_placement(
             value_tt.shape[-1],
             weights.output_projection.shape[-1],
             None,
+            (output_grid.x, output_grid.y),
         ),
         compute_kernel_config=compute_config,
     )
@@ -293,7 +295,12 @@ def test_output_projection_determinism(
         conv_kernel_size=4,
         norm_eps=1e-5,
     )
-    weights = load_kda_weights(mesh_device, config, random_weights(config), tp_axis=tensor_parallel_axis)
+    weights = load_kda_weights(
+        mesh_device,
+        config,
+        random_weights(config),
+        tensor_parallel_axis=tensor_parallel_axis,
+    )
     sequence = 32
     value = torch.randn(1, sequence, config.v_dim, generator=torch.Generator().manual_seed(2817), dtype=torch.bfloat16)
     mesh_dims = [None, None]
@@ -310,6 +317,7 @@ def test_output_projection_determinism(
     compute_config = ttnn.init_device_compute_kernel_config(
         mesh_device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True
     )
+    output_grid = mesh_device.compute_with_storage_grid_size()
     tt_ccl = TT_CCL(mesh_device)
     results = []
 
@@ -319,7 +327,11 @@ def test_output_projection_determinism(
             weights.output_projection,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             program_config=_output_projection_program_config(
-                sequence, value_tt.shape[-1], weights.output_projection.shape[-1], None
+                sequence,
+                value_tt.shape[-1],
+                weights.output_projection.shape[-1],
+                None,
+                (output_grid.x, output_grid.y),
             ),
             compute_kernel_config=compute_config,
         )

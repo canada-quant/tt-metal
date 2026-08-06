@@ -21,7 +21,7 @@ from models.demos.deepseek_v3_d_p.reference.kimi_k3_config import (
     kimi_k3_kda_config,
     kimi_k3_program_config,
 )
-from models.demos.deepseek_v3_d_p.tests.kda.checkpoint import load_kda_layer_state_dict
+from models.demos.deepseek_v3_d_p.tests.kda.checkpoint_utils import load_kda_layer_state_dict
 from models.demos.deepseek_v3_d_p.tt.kda.kda import KdaState, ttKDA
 from models.demos.deepseek_v3_d_p.tt.kda.weights import KDAWeights
 from models.tt_transformers.tt.ccl import TT_CCL
@@ -347,6 +347,7 @@ def make_kimi_k3_device_case(
         layer_idx=KimiK3Config.FIRST_KDA_LAYER,
         weights=weights,
         tt_ccl=TT_CCL(mesh_device),
+        sp_axis=sequence_parallel_axis,
         tp_axis=tensor_parallel_axis,
         summary_group_chunks=summary_group_chunks,
         program_config=program_config or default_program_config,

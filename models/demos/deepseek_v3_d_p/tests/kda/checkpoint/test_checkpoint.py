@@ -9,7 +9,7 @@ import torch
 from safetensors.torch import save_file
 
 from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig
-from models.demos.deepseek_v3_d_p.tests.kda.checkpoint import (
+from models.demos.deepseek_v3_d_p.tests.kda.checkpoint_utils import (
     kda_layer_prefix,
     load_kda_layer_state_dict,
     required_kda_weight_names,

@@ -85,6 +85,7 @@ def test_sp_layer_matches_serial_reference(
         config,
         weights,
         tt_ccl=TT_CCL(mesh_device),
+        sp_axis=sp_axis,
         tp_axis=tensor_parallel_axis,
         program_config=program_config,
     )
@@ -174,6 +175,7 @@ def test_sp_chunked_prefill_matches_one_shot(
         config,
         weights,
         tt_ccl=TT_CCL(mesh_device),
+        sp_axis=sp_axis,
         tp_axis=tensor_parallel_axis,
         summary_group_chunks=summary_group_chunks,
     )
@@ -225,7 +227,7 @@ def test_sp_chunked_prefill_matches_one_shot(
 
     chunked = torch.cat(outputs, dim=1)
     chunked_recurrent = reconstruct_state_at_sp_rank(
-        state.recurrent, mesh_device, sp_axis, tensor_parallel_axis, sp_rank=0
+        chunked_state.recurrent, mesh_device, sp_axis, tensor_parallel_axis, sp_rank=0
     )
     chunked_convolution = reconstruct_convolution_at_sp_rank(
         chunked_state.convolution,
@@ -276,6 +278,7 @@ def test_sp_layer_determinism(
         config,
         weights,
         tt_ccl=TT_CCL(mesh_device),
+        sp_axis=sp_axis,
         tp_axis=tensor_parallel_axis,
         summary_group_chunks=1,
     )
