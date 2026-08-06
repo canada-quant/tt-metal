@@ -60,8 +60,8 @@ tests/
 ├── model/
 │   ├── test_distributed_layer.py       — SP accuracy, segmented continuity, and
 │   │                                     bit-identical implementation determinism.
-│   ├── test_layer.py                   — Composed accuracy, state/cache contracts, and
-│   │                                     bit-identical implementation determinism.
+│   ├── test_layer.py                   — Composed accuracy, state/cache contracts, immutable
+│   │                                     trace replay, and bit-identical determinism.
 │   ├── test_real_weights.py            — Kimi-K3 layer-1 accuracy on all layouts
 │   │                                     with required realtime program records.
 │   └── test_weights.py                 — TP placement and output-projection accuracy plus

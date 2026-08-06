@@ -22,7 +22,11 @@ from models.demos.deepseek_v3_d_p.tt.kda.weights import KDAWeights
 
 pytestmark = [
     run_for_blackhole(),
-    pytest.mark.parametrize("device_params", [{"l1_small_size": 24576}], indirect=True),
+    pytest.mark.parametrize(
+        "device_params",
+        [{"l1_small_size": 24576, "trace_region_size": 256 * 1024 * 1024}],
+        indirect=True,
+    ),
 ]
 
 
@@ -229,3 +233,45 @@ def test_composed_layer_determinism(device: ttnn.Device) -> None:
     for iteration, result in enumerate(results[1:], start=1):
         for name, expected, actual in zip(names, results[0], result):
             assert_bit_identical(expected, actual, name=f"layer {name} iteration {iteration}")
+
+
+def test_composed_layer_immutable_state_trace_replay(device: ttnn.Device) -> None:
+    config = make_config()
+    hidden = torch.randn(1, 32, config.hidden_size, generator=torch.Generator().manual_seed(1917)).to(torch.bfloat16)
+    hidden_tt = ttnn.from_torch(
+        hidden,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    layer = ttKDA(device, config, random_weights(config))
+
+    with ttnn.manage_config("throw_exception_on_fallback", True):
+        layer.forward(hidden_tt, layer.allocate_state())
+    ttnn.synchronize_device(device)
+
+    input_state = layer.allocate_state()
+    input_state_before = (
+        ttnn.to_torch(input_state.recurrent),
+        ttnn.to_torch(input_state.convolution),
+    )
+    trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+    with ttnn.manage_config("throw_exception_on_fallback", True):
+        output, next_state = layer.forward(hidden_tt, input_state)
+    ttnn.end_trace_capture(device, trace_id, cq_id=0)
+    captured_output = ttnn.to_torch(output)
+    assert next_state.recurrent is not input_state.recurrent
+    assert next_state.convolution is not input_state.convolution
+
+    ttnn.execute_trace(device, trace_id, cq_id=0, blocking=True)
+    replayed_output = ttnn.to_torch(output)
+    input_state_after = (
+        ttnn.to_torch(input_state.recurrent),
+        ttnn.to_torch(input_state.convolution),
+    )
+    ttnn.release_trace(device, trace_id)
+
+    assert_bit_identical(captured_output, replayed_output, name="traced layer output")
+    for name, expected, actual in zip(("recurrent", "convolution"), input_state_before, input_state_after):
+        assert_bit_identical(expected, actual, name=f"traced input {name} state")
