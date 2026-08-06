@@ -11,13 +11,13 @@ using namespace tt::tt_metal;
 namespace ttnn::prim {
 namespace {
 
-void check(const Tensor& tensor, const char* name, DataType dtype) {
+void validate_chunk_preparation_tensor(const Tensor& tensor, const char* name, DataType dtype) {
     TT_FATAL(tensor.layout() == Layout::TILE, "kda_chunk_preparation: {} must be TILE layout", name);
     TT_FATAL(tensor.dtype() == dtype, "kda_chunk_preparation: {} has wrong dtype", name);
     TT_FATAL(tensor.buffer() != nullptr, "kda_chunk_preparation: {} must be on device", name);
 }
 
-void check_gate(const Tensor& tensor) {
+void validate_chunk_preparation_gate(const Tensor& tensor) {
     TT_FATAL(tensor.layout() == Layout::TILE, "kda_chunk_preparation: g must be TILE layout");
     TT_FATAL(
         tensor.dtype() == DataType::FLOAT32 || tensor.dtype() == DataType::BFLOAT16,
@@ -35,15 +35,15 @@ KdaChunkPreparationOperation::program_factory_t KdaChunkPreparationOperation::se
 void KdaChunkPreparationOperation::validate_on_program_cache_miss(
     const operation_attributes_t& attrs, const tensor_args_t& in) {
     using namespace tt::constants;
-    check(in.q, "q", DataType::BFLOAT16);
-    check(in.k, "k", DataType::BFLOAT16);
-    check(in.v, "v", DataType::BFLOAT16);
-    check_gate(in.g);
-    check(in.beta, "beta", DataType::FLOAT32);
-    check(in.eye, "eye", DataType::FLOAT32);
-    check(in.tril, "tril", DataType::FLOAT32);
-    check(in.ones, "ones", DataType::FLOAT32);
-    check(in.masks, "masks", DataType::FLOAT32);
+    validate_chunk_preparation_tensor(in.q, "q", DataType::BFLOAT16);
+    validate_chunk_preparation_tensor(in.k, "k", DataType::BFLOAT16);
+    validate_chunk_preparation_tensor(in.v, "v", DataType::BFLOAT16);
+    validate_chunk_preparation_gate(in.g);
+    validate_chunk_preparation_tensor(in.beta, "beta", DataType::FLOAT32);
+    validate_chunk_preparation_tensor(in.eye, "eye", DataType::FLOAT32);
+    validate_chunk_preparation_tensor(in.tril, "tril", DataType::FLOAT32);
+    validate_chunk_preparation_tensor(in.ones, "ones", DataType::FLOAT32);
+    validate_chunk_preparation_tensor(in.masks, "masks", DataType::FLOAT32);
 
     TT_FATAL(attrs.chunk_size % TILE_HEIGHT == 0, "chunk_size must be a multiple of 32");
     TT_FATAL(attrs.key_dim % TILE_WIDTH == 0, "key_dim must be a multiple of 32");

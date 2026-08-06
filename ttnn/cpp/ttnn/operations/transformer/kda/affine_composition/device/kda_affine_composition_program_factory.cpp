@@ -55,6 +55,7 @@ tt::tt_metal::ProgramDescriptor KdaAffineCompositionProgramFactory::create_descr
     add_cb(5, kv);
     add_cb(6, kk);
     add_cb(7, kv);
+    add_cb(9, 1);
     add_cb(10, kv);
     add_cb(11, 1);
 

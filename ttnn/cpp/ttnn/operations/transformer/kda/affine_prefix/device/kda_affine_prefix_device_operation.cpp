@@ -65,6 +65,7 @@ Tensor kda_affine_prefix(
     uint32_t groups,
     const tt::tt_metal::MemoryConfig& mem,
     const DeviceComputeKernelConfig& cfg) {
+    TT_FATAL(groups > 0, "KDA affine prefix groups_per_head must be positive");
     const auto& shape = a.logical_shape();
     auto outputs = ::ttnn::device_operation::launch<KdaAffinePrefixOperation>(
         KdaAffinePrefixParams{

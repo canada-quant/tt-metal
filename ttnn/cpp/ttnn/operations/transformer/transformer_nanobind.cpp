@@ -21,6 +21,8 @@
 #include "kda/causal_convolution/kda_causal_conv_nanobind.hpp"
 #include "kda/chunk_preparation/kda_chunk_preparation_nanobind.hpp"
 #include "kda/final_scan/kda_final_scan_nanobind.hpp"
+#include "kda/affine_composition/kda_affine_composition_nanobind.hpp"
+#include "kda/affine_prefix/kda_affine_prefix_nanobind.hpp"
 #include "sdpa/sdpa_nanobind.hpp"
 #include "sdpa_config.hpp"
 #include "sdpa_decode/sdpa_decode_nanobind.hpp"
@@ -87,6 +89,8 @@ void py_module(nb::module_& mod) {
     bind_kda_causal_conv(mod);
     bind_kda_chunk_preparation(mod);
     bind_kda_final_scan(mod);
+    bind_kda_affine_composition(mod);
+    bind_kda_affine_prefix(mod);
 }
 
 }  // namespace ttnn::operations::transformer
