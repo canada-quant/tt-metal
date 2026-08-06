@@ -46,7 +46,7 @@ tests/
 │   └── test_ops.py                     — Torch operation identities with complete
 │                                         accuracy checks.
 ├── operations/
-│   ├── test_chunk.py                   — chunk_kda accuracy, grouped invariance, and
+│   ├── test_chunk.py                   — chunk recurrence accuracy, grouped invariance, and
 │   │                                     bit-identical implementation determinism.
 │   ├── test_convolution.py             — Fused four-tap Q/K/V convolution accuracy and
 │   │                                     bit-identical implementation determinism.

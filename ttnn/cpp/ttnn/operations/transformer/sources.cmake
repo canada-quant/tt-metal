@@ -36,10 +36,7 @@ set(TTNN_OP_TRANSFORMER_SRCS
     chunk_gated_delta_rule/device/chunk_gdn_phased.cpp
     chunk_gated_delta_rule/device/chunk_gdn_phased_program_factory.cpp
     chunk_gated_delta_rule/chunk_gated_delta_rule.cpp
-    kda/device/kda_phased.cpp
-    kda/device/kda_phased_program_factory.cpp
     kda/device/kda_factory_utils.cpp
-    kda/kda.cpp
 )
 
 # Registered on the shared `ttnn` Python module target from
@@ -55,6 +52,5 @@ set(TTNN_OP_TRANSFORMER_NANOBIND_SRCS
     split_query_key_value_and_split_heads/split_query_key_value_and_split_heads_nanobind.cpp
     gated_delta_attn/gated_delta_attn_nanobind.cpp
     chunk_gated_delta_rule/chunk_gated_delta_rule_nanobind.cpp
-    kda/kda_nanobind.cpp
     transformer_nanobind.cpp
 )

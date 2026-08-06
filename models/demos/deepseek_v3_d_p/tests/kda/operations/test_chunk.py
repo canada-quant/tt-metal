@@ -46,7 +46,7 @@ def _to_device(tensor: torch.Tensor, device: ttnn.Device, dtype: ttnn.DataType) 
         (5152, 2, 32, 32, True, True, True, None, 8, False, True),
     ],
 )
-def test_chunk_kda_pcc(
+def test_chunk_recurrence_pcc(
     device: ttnn.Device,
     sequence: int,
     heads: int,
@@ -216,7 +216,7 @@ def test_grouped_summary_preserves_weak_decay(device: ttnn.Device, production_tu
     assert_accurate(golden_state, ttnn.to_torch(final_state_tt), name=f"{label} grouped state")
 
 
-def test_chunk_kda_determinism(device: ttnn.Device) -> None:
+def test_chunk_recurrence_determinism(device: ttnn.Device) -> None:
     sequence, heads, dim = 64, 2, 32
     generator = torch.Generator().manual_seed(1401)
     shape = (1, sequence, heads)
@@ -247,5 +247,5 @@ def test_chunk_kda_determinism(device: ttnn.Device) -> None:
 
     first_output, first_state = results[0]
     for iteration, (output, final_state) in enumerate(results[1:], start=1):
-        assert_bit_identical(first_output, output, name=f"chunk_kda output iteration {iteration}")
-        assert_bit_identical(first_state, final_state, name=f"chunk_kda state iteration {iteration}")
+        assert_bit_identical(first_output, output, name=f"chunk recurrence output iteration {iteration}")
+        assert_bit_identical(first_state, final_state, name=f"chunk recurrence state iteration {iteration}")
