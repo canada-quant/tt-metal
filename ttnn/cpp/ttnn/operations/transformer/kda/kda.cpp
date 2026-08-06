@@ -13,6 +13,7 @@
 
 #include "device/kda_phased.hpp"
 #include "chunk_preparation/device/kda_chunk_preparation_device_operation.hpp"
+#include "final_scan/device/kda_final_scan_device_operation.hpp"
 
 #include "ttnn/operations/ccl/all_gather/all_gather.hpp"
 #include "ttnn/operations/ccl/mesh_partition/mesh_partition.hpp"
@@ -422,7 +423,7 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
             ShardOrientation::ROW_MAJOR,
             std::array<uint32_t, 2>{K, K},
             Layout::TILE);
-        auto summaries = ttnn::prim::kda_final_scan(
+        auto summaries = ttnn::prim::kda_final_chunk_scan(
             grouped[0],
             grouped[1],
             grouped[2],
@@ -432,13 +433,12 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
             grouped[6],
             std::nullopt,
             C,
-            true,
             summary_mem,
             kernel_cfg,
             true,
-            true,
             eye_c,
-            true);
+            true,
+            false);
         // The summary scan returns A+B (identity seed) and B (zero seed); recover A at the
         // KDA composition layer so the shared scan primitive remains one device operation.
         summaries[0] = ttnn::subtract(summaries[0], summaries[1], std::nullopt, summary_mem);
@@ -451,7 +451,7 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
         TT_FATAL(s0.has_value(), "group-prefix scan requires initial state");
         const auto prefix_mem = distributed_prefix ? out_mem : ttnn::L1_MEMORY_CONFIG;
         const auto run_grouped_scan = [&](const ttnn::Tensor& group_initial_states) {
-            return ttnn::prim::kda_final_scan(
+            return ttnn::prim::kda_final_chunk_scan(
                 grouped[0],
                 grouped[1],
                 grouped[2],
@@ -461,10 +461,8 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
                 grouped[6],
                 group_initial_states,
                 C,
-                true,
                 out_mem,
                 grouped_scan_kernel_cfg,
-                true,
                 false,
                 std::nullopt,
                 false,
@@ -510,7 +508,7 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
     if (grouped_scan.has_value()) {
         scan = *grouped_scan;
     } else {
-        scan = ttnn::prim::kda_final_scan(
+        scan = ttnn::prim::kda_final_chunk_scan(
             prep[0],
             prep[1],
             prep[2],
@@ -520,12 +518,12 @@ std::tuple<ttnn::Tensor, std::optional<ttnn::Tensor>> chunk_kda(
             prep[6],
             s0,
             C,
-            output_final_state,
             out_mem,
             kernel_cfg,
-            true,
             false,
-            std::nullopt);
+            std::nullopt,
+            false,
+            false);
     }
 
     std::optional<ttnn::Tensor> final_state;
