@@ -8,6 +8,7 @@ import hashlib
 import inspect
 import json
 import os
+import statistics
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -52,6 +53,7 @@ pytestmark = [
 
 _SEQUENCE = 5120
 _REPETITIONS = 10
+_TIMING_SAMPLES = 5
 _PCC_THRESHOLD = 0.98
 _PERF_TARGETS_PATH = Path(__file__).parent / "perf_targets" / "bh_loudbox.json"
 _CPU_REFERENCE_CACHE_VERSION = 2
@@ -182,12 +184,12 @@ def _deallocate_state(state: KdaState) -> None:
     ttnn.deallocate(state.convolution)
 
 
-def _trace_wall_ms(
+def _trace_wall_samples_ms(
     mesh_device: ttnn.MeshDevice,
     layer: ttKDA,
     hidden: ttnn.Tensor,
     repetitions: int,
-) -> float:
+) -> list[float]:
     state = _allocate_state(layer)
     warm_output, warm_state = layer.forward(hidden, state)
     ttnn.synchronize_device(mesh_device)
@@ -198,16 +200,18 @@ def _trace_wall_ms(
     ttnn.end_trace_capture(mesh_device, trace_id, cq_id=0)
     ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
     ttnn.synchronize_device(mesh_device)
-    start = time.perf_counter()
-    for _ in range(repetitions):
-        ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
-    ttnn.synchronize_device(mesh_device)
-    elapsed = time.perf_counter() - start
+    samples_ms = []
+    for _ in range(_TIMING_SAMPLES):
+        start = time.perf_counter()
+        for _ in range(repetitions):
+            ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
+        ttnn.synchronize_device(mesh_device)
+        samples_ms.append((time.perf_counter() - start) * 1e3 / repetitions)
     ttnn.release_trace(mesh_device, trace_id)
     ttnn.deallocate(output)
     _deallocate_state(state)
     _deallocate_state(next_state)
-    return elapsed * 1e3 / repetitions
+    return samples_ms
 
 
 @pytest.mark.parametrize(
@@ -257,7 +261,10 @@ def test_kimi_k3_layer_1_perf(
     _deallocate_state(state)
 
     repetitions = int(os.getenv("PERF_REPS", str(_REPETITIONS)))
-    wall_ms = _trace_wall_ms(mesh_device, layer, hidden_tt, repetitions)
+    samples_ms = _trace_wall_samples_ms(mesh_device, layer, hidden_tt, repetitions)
+    wall_ms = samples_ms[0]
+    median_wall_ms = statistics.median(samples_ms)
+    tail_wall_ms = max(samples_ms)
     reference_ms, max_regression_pct = _load_perf_target(layout, sequence=sequence, repetitions=repetitions)
     max_wall_ms = reference_ms * (1.0 + max_regression_pct / 100.0)
     result = {
@@ -268,6 +275,10 @@ def test_kimi_k3_layer_1_perf(
         "pcc": pcc,
         "pcc_reference": "independent pure-Torch FP32 CPU reference",
         "trace_wall_ms": wall_ms,
+        "trace_wall_samples_ms": samples_ms,
+        "median_trace_wall_ms": median_wall_ms,
+        "tail_trace_wall_ms": tail_wall_ms,
+        "timing_sample_count": _TIMING_SAMPLES,
         "reference_trace_wall_ms": reference_ms,
         "max_regression_pct": max_regression_pct,
         "max_trace_wall_ms": max_wall_ms,
