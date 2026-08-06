@@ -10,6 +10,7 @@ import torch
 import ttnn
 from models.common.utility_functions import run_for_blackhole
 from models.demos.deepseek_v3_d_p.tests.kda.utils import assert_bit_identical, assert_equal
+from models.demos.deepseek_v3_d_p.tt.kda import ops
 
 pytestmark = [
     run_for_blackhole(),
@@ -75,7 +76,7 @@ def test_convolution_halo_preserves_causal_carries(
     qkv_tt = _to_device(qkv, mesh_device, tuple(qkv_dims))
     state_tt = _to_device(external, mesh_device, tuple(state_dims))
 
-    entry_tt, final_tt = ttnn.transformer.kda_convolution_halo(
+    entry_tt, final_tt = ops.convolution_halo(
         qkv_tt,
         state_tt,
         sequence_parallel_axis=sp_axis,
@@ -120,7 +121,7 @@ def test_convolution_halo_determinism(
 
     results = []
     for _ in range(3):
-        entry_tt, final_tt = ttnn.transformer.kda_convolution_halo(qkv_tt, state_tt, sequence_parallel_axis=sp_axis)
+        entry_tt, final_tt = ops.convolution_halo(qkv_tt, state_tt, sequence_parallel_axis=sp_axis)
         ttnn.synchronize_device(mesh_device)
         results.append(
             (

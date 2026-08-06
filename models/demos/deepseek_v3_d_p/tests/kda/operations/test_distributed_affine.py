@@ -10,6 +10,7 @@ import torch
 import ttnn
 from models.common.utility_functions import run_for_blackhole
 from models.demos.deepseek_v3_d_p.tests.kda.utils import assert_accurate, assert_bit_identical
+from models.demos.deepseek_v3_d_p.tt.kda import ops
 
 pytestmark = [
     run_for_blackhole(),
@@ -159,7 +160,7 @@ def test_distributed_affine_prefix_matches_serial_and_all_gather(
         a_tt, b_tt, initial_state, mesh_device, sp_axis, tensor_parallel_axis
     )
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        entry_tt, final_tt = ttnn.transformer._kda_distributed_affine_prefix(
+        entry_tt, final_tt = ops.distributed_affine_prefix(
             a_tt,
             b_tt,
             state_tt,
@@ -169,7 +170,7 @@ def test_distributed_affine_prefix_matches_serial_and_all_gather(
         )
     cache_entries = mesh_device.num_program_cache_entries()
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        repeated_entry_tt, repeated_final_tt = ttnn.transformer._kda_distributed_affine_prefix(
+        repeated_entry_tt, repeated_final_tt = ops.distributed_affine_prefix(
             a_tt,
             b_tt,
             state_tt,
@@ -182,7 +183,7 @@ def test_distributed_affine_prefix_matches_serial_and_all_gather(
 
     trace_id = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        traced_entry_tt, traced_final_tt = ttnn.transformer._kda_distributed_affine_prefix(
+        traced_entry_tt, traced_final_tt = ops.distributed_affine_prefix(
             a_tt,
             b_tt,
             state_tt,
@@ -242,9 +243,7 @@ def test_distributed_affine_prefix_determinism(
 
     results = []
     for _ in range(3):
-        entry_tt, final_tt = ttnn.transformer._kda_distributed_affine_prefix(
-            a_tt, b_tt, state_tt, sequence_parallel_axis=sp_axis
-        )
+        entry_tt, final_tt = ops.distributed_affine_prefix(a_tt, b_tt, state_tt, sequence_parallel_axis=sp_axis)
         ttnn.synchronize_device(mesh_device)
         results.append(
             (
