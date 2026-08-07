@@ -22,19 +22,19 @@ pytestmark = [
 def test_chunk_scan_strategy_policy(device: ttnn.Device) -> None:
     del device
     cases = (
-        (159, 8, None, ops._ScanStrategy.DIRECT),
-        (160, 8, None, ops._ScanStrategy.GROUPED),
-        (161, 8, None, ops._ScanStrategy.DIRECT),
-        (8, 8, 0, ops._ScanStrategy.DISTRIBUTED_GROUPED),
-        (9, 8, 0, ops._ScanStrategy.DISTRIBUTED_GROUPED),
+        (159, 8, None, ops._DirectScan),
+        (160, 8, None, ops._LocalGroupedScan),
+        (161, 8, None, ops._DirectScan),
+        (8, 8, 0, ops._DistributedGroupedScan),
+        (9, 8, 0, ops._DistributedGroupedScan),
     )
     for num_chunks, group_chunks, sp_axis, expected in cases:
-        actual = ops._select_scan_strategy(
+        actual = ops._select_scan(
             num_chunks=num_chunks,
             summary_group_chunks=group_chunks,
             sequence_parallel_axis=sp_axis,
         )
-        assert actual is expected
+        assert isinstance(actual, expected)
 
 
 def _to_device(tensor: torch.Tensor, device: ttnn.Device, dtype: ttnn.DataType) -> ttnn.Tensor:

@@ -8,8 +8,8 @@ perform the bespoke kernels exposed by ``ttnn.transformer.kda_*``.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum, auto
 
 import ttnn
 from models.demos.deepseek_v3_d_p.tt.kda.const_tiles import build_kda_const_tiles
@@ -145,14 +145,8 @@ def _group_summary_memory_config(device, group_heads: int, key_dim: int) -> ttnn
 _MIN_CHUNKS_FOR_GROUPED_SCAN = 160
 
 
-class _ScanStrategy(Enum):
-    DIRECT = auto()
-    GROUPED = auto()
-    DISTRIBUTED_GROUPED = auto()
-
-
 @dataclass(frozen=True)
-class _RecurrencePlan:
+class _RecurrenceGeometry:
     batch: int
     sequence: int
     heads: int
@@ -164,7 +158,6 @@ class _RecurrencePlan:
     qk_are_flat: bool
     v_is_flat: bool
     gate_is_flat: bool
-    strategy: _ScanStrategy
 
     @property
     def batch_heads(self) -> int:
@@ -218,20 +211,19 @@ class _ScanResult:
     final_state: ttnn.Tensor
 
 
-def _select_scan_strategy(
-    *,
-    num_chunks: int,
-    summary_group_chunks: int,
-    sequence_parallel_axis: int | None,
-) -> _ScanStrategy:
-    if sequence_parallel_axis is not None:
-        return _ScanStrategy.DISTRIBUTED_GROUPED
-    if num_chunks >= _MIN_CHUNKS_FOR_GROUPED_SCAN and num_chunks % summary_group_chunks == 0:
-        return _ScanStrategy.GROUPED
-    return _ScanStrategy.DIRECT
+@dataclass(frozen=True)
+class _ScanConfig:
+    summary_group_chunks: int
+    output_memory_config: ttnn.MemoryConfig
+    compute_kernel_config: ttnn.DeviceComputeKernelConfig | None
+    affine_summary_dtype: ttnn.DataType
+    recurrent_state_dtype: ttnn.DataType
+    affine_prefix_compute_kernel_config: ttnn.DeviceComputeKernelConfig | None
+    grouped_scan_output_dtype: ttnn.DataType
+    grouped_scan_compute_kernel_config: ttnn.DeviceComputeKernelConfig | None
 
 
-def _validate_and_plan_recurrence(
+def _validate_recurrence_geometry(
     q_input: ttnn.Tensor,
     k_input: ttnn.Tensor,
     v_input: ttnn.Tensor,
@@ -244,7 +236,7 @@ def _validate_and_plan_recurrence(
     affine_summary_dtype: ttnn.DataType,
     recurrent_state_dtype: ttnn.DataType,
     grouped_scan_output_dtype: ttnn.DataType,
-) -> _RecurrencePlan:
+) -> _RecurrenceGeometry:
     """Validate the existing KDA input contract and derive host-only execution metadata."""
     q_shape = tuple(q_input.shape)
     k_shape = tuple(k_input.shape)
@@ -293,7 +285,7 @@ def _validate_and_plan_recurrence(
     if (qk_are_flat or v_is_flat or gate_is_flat) and pad:
         raise ValueError("flat KDA recurrence inputs require T divisible by chunk_size")
 
-    return _RecurrencePlan(
+    return _RecurrenceGeometry(
         batch=batch,
         sequence=sequence,
         heads=heads,
@@ -305,11 +297,6 @@ def _validate_and_plan_recurrence(
         qk_are_flat=qk_are_flat,
         v_is_flat=v_is_flat,
         gate_is_flat=gate_is_flat,
-        strategy=_select_scan_strategy(
-            num_chunks=num_chunks,
-            summary_group_chunks=summary_group_chunks,
-            sequence_parallel_axis=sequence_parallel_axis,
-        ),
     )
 
 
@@ -319,56 +306,58 @@ def _prepare_chunk_inputs(
     v_input: ttnn.Tensor,
     gate_input: ttnn.Tensor,
     beta_input: ttnn.Tensor,
-    plan: _RecurrencePlan,
+    geometry: _RecurrenceGeometry,
     *,
     qk_scale: float,
 ) -> _ChunkInputs:
-    if plan.qk_are_flat:
+    if geometry.qk_are_flat:
         q = q_input if q_input.dtype == ttnn.bfloat16 else ttnn.typecast(q_input, ttnn.bfloat16)
         k = k_input if k_input.dtype == ttnn.bfloat16 else ttnn.typecast(k_input, ttnn.bfloat16)
     else:
-        q = _head_split(q_input, plan.batch, plan.sequence, plan.heads, plan.key_dim, ttnn.bfloat16)
+        q = _head_split(q_input, geometry.batch, geometry.sequence, geometry.heads, geometry.key_dim, ttnn.bfloat16)
         q = ttnn.multiply(q, qk_scale)
-        k = _head_split(k_input, plan.batch, plan.sequence, plan.heads, plan.key_dim, ttnn.bfloat16)
+        k = _head_split(k_input, geometry.batch, geometry.sequence, geometry.heads, geometry.key_dim, ttnn.bfloat16)
     v = (
         v_input
-        if plan.v_is_flat and v_input.dtype == ttnn.bfloat16
+        if geometry.v_is_flat and v_input.dtype == ttnn.bfloat16
         else (
             ttnn.typecast(v_input, ttnn.bfloat16)
-            if plan.v_is_flat
-            else _head_split(v_input, plan.batch, plan.sequence, plan.heads, plan.value_dim, ttnn.bfloat16)
+            if geometry.v_is_flat
+            else _head_split(
+                v_input, geometry.batch, geometry.sequence, geometry.heads, geometry.value_dim, ttnn.bfloat16
+            )
         )
     )
     gate = (
         gate_input
-        if plan.gate_is_flat
-        else _head_split(gate_input, plan.batch, plan.sequence, plan.heads, plan.key_dim, ttnn.float32)
+        if geometry.gate_is_flat
+        else _head_split(gate_input, geometry.batch, geometry.sequence, geometry.heads, geometry.key_dim, ttnn.float32)
     )
-    beta = _head_vector_split(beta_input, plan.batch, plan.sequence, plan.heads)
-    if not plan.qk_are_flat:
-        q = _pad_time(q, plan.batch_heads, plan.key_dim, plan.pad)
-        k = _pad_time(k, plan.batch_heads, plan.key_dim, plan.pad)
-    if not plan.v_is_flat:
-        v = _pad_time(v, plan.batch_heads, plan.value_dim, plan.pad)
-    if not plan.gate_is_flat:
-        gate = _pad_time(gate, plan.batch_heads, plan.key_dim, plan.pad)
-    if plan.pad:
+    beta = _head_vector_split(beta_input, geometry.batch, geometry.sequence, geometry.heads)
+    if not geometry.qk_are_flat:
+        q = _pad_time(q, geometry.batch_heads, geometry.key_dim, geometry.pad)
+        k = _pad_time(k, geometry.batch_heads, geometry.key_dim, geometry.pad)
+    if not geometry.v_is_flat:
+        v = _pad_time(v, geometry.batch_heads, geometry.value_dim, geometry.pad)
+    if not geometry.gate_is_flat:
+        gate = _pad_time(gate, geometry.batch_heads, geometry.key_dim, geometry.pad)
+    if geometry.pad:
         beta_zeros = ttnn.zeros(
-            (plan.batch_heads, plan.pad),
+            (geometry.batch_heads, geometry.pad),
             dtype=ttnn.float32,
             layout=ttnn.TILE_LAYOUT,
             device=q_input.device(),
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         beta = ttnn.concat([beta, beta_zeros], dim=1)
-    if not plan.qk_are_flat:
-        q = ttnn.reshape(q, (plan.batch_heads, plan.num_chunks, plan.chunk_size, plan.key_dim))
-        k = ttnn.reshape(k, (plan.batch_heads, plan.num_chunks, plan.chunk_size, plan.key_dim))
-    if not plan.v_is_flat:
-        v = ttnn.reshape(v, (plan.batch_heads, plan.num_chunks, plan.chunk_size, plan.value_dim))
-    if not plan.gate_is_flat:
-        gate = ttnn.reshape(gate, (plan.batch_heads, plan.num_chunks, plan.chunk_size, plan.key_dim))
-    beta = ttnn.reshape(beta, (plan.batch_heads, plan.num_chunks, plan.chunk_size, 1))
+    if not geometry.qk_are_flat:
+        q = ttnn.reshape(q, (geometry.batch_heads, geometry.num_chunks, geometry.chunk_size, geometry.key_dim))
+        k = ttnn.reshape(k, (geometry.batch_heads, geometry.num_chunks, geometry.chunk_size, geometry.key_dim))
+    if not geometry.v_is_flat:
+        v = ttnn.reshape(v, (geometry.batch_heads, geometry.num_chunks, geometry.chunk_size, geometry.value_dim))
+    if not geometry.gate_is_flat:
+        gate = ttnn.reshape(gate, (geometry.batch_heads, geometry.num_chunks, geometry.chunk_size, geometry.key_dim))
+    beta = ttnn.reshape(beta, (geometry.batch_heads, geometry.num_chunks, geometry.chunk_size, 1))
     return _ChunkInputs(q=q, k=k, v=v, gate=gate, beta=beta)
 
 
@@ -390,28 +379,29 @@ def _resolve_chunk_constants(
 
 def _prepare_initial_state(
     initial_state: ttnn.Tensor | None,
-    plan: _RecurrencePlan,
+    geometry: _RecurrenceGeometry,
     *,
     device,
 ) -> ttnn.Tensor:
     if initial_state is None:
         return ttnn.zeros(
-            (plan.batch_heads, plan.key_dim, plan.value_dim),
+            (geometry.batch_heads, geometry.key_dim, geometry.value_dim),
             dtype=ttnn.float32,
             layout=ttnn.TILE_LAYOUT,
             device=device,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
     state = initial_state if initial_state.dtype == ttnn.float32 else ttnn.typecast(initial_state, ttnn.float32)
-    return ttnn.reshape(state, (plan.batch_heads, plan.key_dim, plan.value_dim))
+    return ttnn.reshape(state, (geometry.batch_heads, geometry.key_dim, geometry.value_dim))
 
 
 def _prepare_chunk_terms(
     inputs: _ChunkInputs,
     constants: tuple[ttnn.Tensor, ttnn.Tensor, ttnn.Tensor, ttnn.Tensor],
-    plan: _RecurrencePlan,
+    geometry: _RecurrenceGeometry,
     *,
     qk_scale: float,
+    memory_config: ttnn.MemoryConfig | None,
     compute_kernel_config: ttnn.DeviceComputeKernelConfig | None,
     use_bf16_prep_intermediates: bool,
 ) -> _PreparedChunks:
@@ -427,60 +417,52 @@ def _prepare_chunk_terms(
         tril_tile,
         ones_tile,
         mask_tiles,
-        chunk_size=plan.chunk_size,
-        memory_config=(ttnn.DRAM_MEMORY_CONFIG if plan.strategy is _ScanStrategy.DISTRIBUTED_GROUPED else None),
+        chunk_size=geometry.chunk_size,
+        memory_config=memory_config,
         compute_kernel_config=compute_kernel_config,
-        v_flat=plan.v_is_flat,
-        value_heads=plan.heads,
-        normalize_qk=plan.qk_are_flat,
+        v_flat=geometry.v_is_flat,
+        value_heads=geometry.heads,
+        normalize_qk=geometry.qk_are_flat,
         scale=qk_scale,
-        qk_flat=plan.qk_are_flat,
-        key_heads=plan.heads,
-        gate_flat=plan.gate_is_flat,
+        qk_flat=geometry.qk_are_flat,
+        key_heads=geometry.heads,
+        gate_flat=geometry.gate_is_flat,
         output_bf16_mask=prep_bf16_mask,
     )
     return _PreparedChunks.from_kernel_outputs(outputs)
 
 
-def _scan_chunks_direct(
-    prepared: _PreparedChunks,
-    initial_state: ttnn.Tensor,
-    plan: _RecurrencePlan,
-    *,
-    memory_config: ttnn.MemoryConfig,
-    compute_kernel_config: ttnn.DeviceComputeKernelConfig | None,
-) -> _ScanResult:
-    output, final_state = ttnn.transformer.kda_final_chunk_scan(
-        *prepared.as_kernel_args(),
-        initial_state=initial_state,
-        chunk_size=plan.chunk_size,
-        memory_config=memory_config,
-        compute_kernel_config=compute_kernel_config,
-    )
-    return _ScanResult(output=output, final_state=final_state)
-
-
 def _reshape_chunks_for_groups(
     prepared: _PreparedChunks,
-    plan: _RecurrencePlan,
+    geometry: _RecurrenceGeometry,
     *,
     group_heads: int,
     summary_group_chunks: int,
 ) -> _PreparedChunks:
     return _PreparedChunks(
-        v_beta=ttnn.reshape(prepared.v_beta, (group_heads, summary_group_chunks, plan.chunk_size, plan.value_dim)),
-        kd=ttnn.reshape(prepared.kd, (group_heads, summary_group_chunks, plan.chunk_size, plan.key_dim)),
-        q_decay=ttnn.reshape(prepared.q_decay, (group_heads, summary_group_chunks, plan.chunk_size, plan.key_dim)),
-        intra=ttnn.reshape(prepared.intra, (group_heads, summary_group_chunks, plan.chunk_size, plan.chunk_size)),
-        k_dec_t=ttnn.reshape(prepared.k_dec_t, (group_heads, summary_group_chunks, plan.key_dim, plan.chunk_size)),
-        final_decay=ttnn.reshape(prepared.final_decay, (group_heads, summary_group_chunks, plan.key_dim, 1)),
-        t_inv=ttnn.reshape(prepared.t_inv, (group_heads, summary_group_chunks, plan.chunk_size, plan.chunk_size)),
+        v_beta=ttnn.reshape(
+            prepared.v_beta, (group_heads, summary_group_chunks, geometry.chunk_size, geometry.value_dim)
+        ),
+        kd=ttnn.reshape(prepared.kd, (group_heads, summary_group_chunks, geometry.chunk_size, geometry.key_dim)),
+        q_decay=ttnn.reshape(
+            prepared.q_decay, (group_heads, summary_group_chunks, geometry.chunk_size, geometry.key_dim)
+        ),
+        intra=ttnn.reshape(
+            prepared.intra, (group_heads, summary_group_chunks, geometry.chunk_size, geometry.chunk_size)
+        ),
+        k_dec_t=ttnn.reshape(
+            prepared.k_dec_t, (group_heads, summary_group_chunks, geometry.key_dim, geometry.chunk_size)
+        ),
+        final_decay=ttnn.reshape(prepared.final_decay, (group_heads, summary_group_chunks, geometry.key_dim, 1)),
+        t_inv=ttnn.reshape(
+            prepared.t_inv, (group_heads, summary_group_chunks, geometry.chunk_size, geometry.chunk_size)
+        ),
     )
 
 
 def _summarize_chunk_groups(
     grouped: _PreparedChunks,
-    plan: _RecurrencePlan,
+    geometry: _RecurrenceGeometry,
     *,
     identity_tile: ttnn.Tensor,
     summary_memory_config: ttnn.MemoryConfig,
@@ -489,7 +471,7 @@ def _summarize_chunk_groups(
 ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
     raw_first, raw_second = ttnn.transformer.kda_final_chunk_scan(
         *grouped.as_kernel_args(),
-        chunk_size=plan.chunk_size,
+        chunk_size=geometry.chunk_size,
         memory_config=summary_memory_config,
         compute_kernel_config=compute_kernel_config,
         state_only=True,
@@ -510,178 +492,277 @@ def _summarize_chunk_groups(
     return summary_a, summary_b
 
 
-def _compute_group_entry_states(
-    summary_a: ttnn.Tensor,
-    summary_b: ttnn.Tensor,
-    initial_state: ttnn.Tensor,
-    plan: _RecurrencePlan,
-    *,
-    groups_per_head: int,
-    sequence_parallel_axis: int | None,
-    output_memory_config: ttnn.MemoryConfig,
-    affine_summary_dtype: ttnn.DataType,
-    recurrent_state_dtype: ttnn.DataType,
-    compute_kernel_config: ttnn.DeviceComputeKernelConfig | None,
-) -> tuple[ttnn.Tensor, ttnn.Tensor | None]:
-    prefix_memory_config = (
-        output_memory_config if plan.strategy is _ScanStrategy.DISTRIBUTED_GROUPED else ttnn.L1_MEMORY_CONFIG
-    )
-    if plan.strategy is _ScanStrategy.DISTRIBUTED_GROUPED:
-        if sequence_parallel_axis is None:
-            raise RuntimeError("distributed KDA scan requires sequence_parallel_axis")
+class _RecurrenceScan(ABC):
+    @property
+    def preparation_memory_config(self) -> ttnn.MemoryConfig | None:
+        return None
+
+    @abstractmethod
+    def run(
+        self,
+        prepared: _PreparedChunks,
+        initial_state: ttnn.Tensor,
+        identity_tile: ttnn.Tensor,
+        geometry: _RecurrenceGeometry,
+        config: _ScanConfig,
+    ) -> _ScanResult:
+        """Run the selected recurrence scan without changing the device operation order."""
+
+
+class _DirectScan(_RecurrenceScan):
+    def run(
+        self,
+        prepared: _PreparedChunks,
+        initial_state: ttnn.Tensor,
+        identity_tile: ttnn.Tensor,
+        geometry: _RecurrenceGeometry,
+        config: _ScanConfig,
+    ) -> _ScanResult:
+        del identity_tile
+        output, final_state = ttnn.transformer.kda_final_chunk_scan(
+            *prepared.as_kernel_args(),
+            initial_state=initial_state,
+            chunk_size=geometry.chunk_size,
+            memory_config=config.output_memory_config,
+            compute_kernel_config=config.compute_kernel_config,
+        )
+        return _ScanResult(output=output, final_state=final_state)
+
+
+class _GroupedScan(_RecurrenceScan):
+    def run(
+        self,
+        prepared: _PreparedChunks,
+        initial_state: ttnn.Tensor,
+        identity_tile: ttnn.Tensor,
+        geometry: _RecurrenceGeometry,
+        config: _ScanConfig,
+    ) -> _ScanResult:
+        if geometry.num_chunks % config.summary_group_chunks:
+            raise ValueError(
+                f"local chunk count {geometry.num_chunks} must be divisible by "
+                f"summary_group_chunks {config.summary_group_chunks}"
+            )
+        if geometry.key_dim != geometry.value_dim:
+            raise ValueError("grouped KDA affine prefix currently requires K == V")
+        groups_per_head = geometry.num_chunks // config.summary_group_chunks
+        group_heads = geometry.batch_heads * groups_per_head
+        grid = prepared.v_beta.device().compute_with_storage_grid_size()
+        if group_heads > min(grid.x * grid.y, 128):
+            raise ValueError(f"grouped KDA needs {group_heads} summary owners, but only 128 are supported")
+
+        grouped = _reshape_chunks_for_groups(
+            prepared,
+            geometry,
+            group_heads=group_heads,
+            summary_group_chunks=config.summary_group_chunks,
+        )
+        summary_memory_config = _group_summary_memory_config(prepared.v_beta.device(), group_heads, geometry.key_dim)
+        summary_a, summary_b = _summarize_chunk_groups(
+            grouped,
+            geometry,
+            identity_tile=identity_tile,
+            summary_memory_config=summary_memory_config,
+            affine_summary_dtype=config.affine_summary_dtype,
+            compute_kernel_config=config.compute_kernel_config,
+        )
+        group_initial_states, strategy_final_state = self._compute_group_entry_states(
+            summary_a,
+            summary_b,
+            initial_state,
+            groups_per_head,
+            config,
+        )
+        grouped_output, grouped_final_states = ttnn.transformer.kda_final_chunk_scan(
+            *grouped.as_kernel_args(),
+            initial_state=group_initial_states,
+            chunk_size=geometry.chunk_size,
+            memory_config=config.output_memory_config,
+            compute_kernel_config=config.grouped_scan_compute_kernel_config,
+            output_bf16=config.grouped_scan_output_dtype == ttnn.bfloat16,
+        )
+        output = ttnn.reshape(
+            grouped_output,
+            (geometry.batch_heads, geometry.num_chunks, geometry.chunk_size, geometry.value_dim),
+        )
+        final_state = self._resolve_final_state(
+            grouped_final_states,
+            strategy_final_state,
+            geometry,
+            groups_per_head,
+            config.output_memory_config,
+        )
+        return _ScanResult(output=output, final_state=final_state)
+
+    @abstractmethod
+    def _compute_group_entry_states(
+        self,
+        summary_a: ttnn.Tensor,
+        summary_b: ttnn.Tensor,
+        initial_state: ttnn.Tensor,
+        groups_per_head: int,
+        config: _ScanConfig,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor | None]:
+        ...
+
+    @abstractmethod
+    def _resolve_final_state(
+        self,
+        grouped_final_states: ttnn.Tensor,
+        strategy_final_state: ttnn.Tensor | None,
+        geometry: _RecurrenceGeometry,
+        groups_per_head: int,
+        output_memory_config: ttnn.MemoryConfig,
+    ) -> ttnn.Tensor:
+        ...
+
+
+class _LocalGroupedScan(_GroupedScan):
+    def _compute_group_entry_states(
+        self,
+        summary_a: ttnn.Tensor,
+        summary_b: ttnn.Tensor,
+        initial_state: ttnn.Tensor,
+        groups_per_head: int,
+        config: _ScanConfig,
+    ) -> tuple[ttnn.Tensor, None]:
+        group_initial_states = ttnn.transformer.kda_affine_prefix(
+            summary_a,
+            summary_b,
+            initial_state,
+            groups_per_head,
+            memory_config=ttnn.L1_MEMORY_CONFIG,
+            compute_kernel_config=config.affine_prefix_compute_kernel_config,
+        )
+        return group_initial_states, None
+
+    def _resolve_final_state(
+        self,
+        grouped_final_states: ttnn.Tensor,
+        strategy_final_state: ttnn.Tensor | None,
+        geometry: _RecurrenceGeometry,
+        groups_per_head: int,
+        output_memory_config: ttnn.MemoryConfig,
+    ) -> ttnn.Tensor:
+        if strategy_final_state is not None:
+            raise RuntimeError("local grouped KDA scan unexpectedly produced a distributed final state")
+        all_final_states = ttnn.reshape(
+            grouped_final_states,
+            (geometry.batch_heads, groups_per_head, geometry.key_dim, geometry.value_dim),
+        )
+        last_final_state = ttnn.slice(
+            all_final_states,
+            (0, groups_per_head - 1, 0, 0),
+            (geometry.batch_heads, groups_per_head, geometry.key_dim, geometry.value_dim),
+            memory_config=output_memory_config,
+        )
+        return ttnn.reshape(last_final_state, (geometry.batch_heads, geometry.key_dim, geometry.value_dim))
+
+
+class _DistributedGroupedScan(_GroupedScan):
+    def __init__(self, sequence_parallel_axis: int) -> None:
+        self._sequence_parallel_axis = sequence_parallel_axis
+
+    @property
+    def preparation_memory_config(self) -> ttnn.MemoryConfig:
+        return ttnn.DRAM_MEMORY_CONFIG
+
+    def _compute_group_entry_states(
+        self,
+        summary_a: ttnn.Tensor,
+        summary_b: ttnn.Tensor,
+        initial_state: ttnn.Tensor,
+        groups_per_head: int,
+        config: _ScanConfig,
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         partition_a, partition_b = ttnn.transformer.kda_affine_compose(
             summary_a,
             summary_b,
             groups_per_head,
-            memory_config=prefix_memory_config,
-            compute_kernel_config=compute_kernel_config,
+            memory_config=config.output_memory_config,
+            compute_kernel_config=config.affine_prefix_compute_kernel_config,
         )
         partition_entry_state, distributed_final_state = distributed_affine_prefix(
             partition_a,
             partition_b,
             initial_state,
-            sequence_parallel_axis=sequence_parallel_axis,
-            memory_config=output_memory_config,
-            compute_kernel_config=compute_kernel_config,
-            affine_summary_dtype=affine_summary_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
+            sequence_parallel_axis=self._sequence_parallel_axis,
+            memory_config=config.output_memory_config,
+            compute_kernel_config=config.affine_prefix_compute_kernel_config,
+            affine_summary_dtype=config.affine_summary_dtype,
+            recurrent_state_dtype=config.recurrent_state_dtype,
         )
         if partition_entry_state.dtype != ttnn.float32:
             partition_entry_state = ttnn.typecast(
                 partition_entry_state,
                 ttnn.float32,
-                memory_config=prefix_memory_config,
+                memory_config=config.output_memory_config,
             )
         group_initial_states = ttnn.transformer.kda_affine_prefix(
             summary_a,
             summary_b,
             partition_entry_state,
             groups_per_head,
-            memory_config=prefix_memory_config,
-            compute_kernel_config=compute_kernel_config,
+            memory_config=config.output_memory_config,
+            compute_kernel_config=config.affine_prefix_compute_kernel_config,
         )
         return group_initial_states, distributed_final_state
 
-    group_initial_states = ttnn.transformer.kda_affine_prefix(
-        summary_a,
-        summary_b,
-        initial_state,
-        groups_per_head,
-        memory_config=prefix_memory_config,
-        compute_kernel_config=compute_kernel_config,
-    )
-    return group_initial_states, None
+    def _resolve_final_state(
+        self,
+        grouped_final_states: ttnn.Tensor,
+        strategy_final_state: ttnn.Tensor | None,
+        geometry: _RecurrenceGeometry,
+        groups_per_head: int,
+        output_memory_config: ttnn.MemoryConfig,
+    ) -> ttnn.Tensor:
+        del grouped_final_states, geometry, groups_per_head, output_memory_config
+        if strategy_final_state is None:
+            raise RuntimeError("distributed grouped KDA scan did not produce a final state")
+        return strategy_final_state
 
 
-def _scan_chunk_groups(
-    prepared: _PreparedChunks,
-    initial_state: ttnn.Tensor,
-    identity_tile: ttnn.Tensor,
-    plan: _RecurrencePlan,
+def _select_scan(
     *,
+    num_chunks: int,
     summary_group_chunks: int,
     sequence_parallel_axis: int | None,
-    output_memory_config: ttnn.MemoryConfig,
-    compute_kernel_config: ttnn.DeviceComputeKernelConfig | None,
-    affine_summary_dtype: ttnn.DataType,
-    recurrent_state_dtype: ttnn.DataType,
-    affine_prefix_compute_kernel_config: ttnn.DeviceComputeKernelConfig | None,
-    grouped_scan_output_dtype: ttnn.DataType,
-    grouped_scan_compute_kernel_config: ttnn.DeviceComputeKernelConfig | None,
-) -> _ScanResult:
-    if plan.num_chunks % summary_group_chunks:
-        raise ValueError(
-            f"local chunk count {plan.num_chunks} must be divisible by summary_group_chunks {summary_group_chunks}"
-        )
-    if plan.key_dim != plan.value_dim:
-        raise ValueError("grouped KDA affine prefix currently requires K == V")
-    groups_per_head = plan.num_chunks // summary_group_chunks
-    group_heads = plan.batch_heads * groups_per_head
-    grid = prepared.v_beta.device().compute_with_storage_grid_size()
-    if group_heads > min(grid.x * grid.y, 128):
-        raise ValueError(f"grouped KDA needs {group_heads} summary owners, but only 128 are supported")
-
-    grouped = _reshape_chunks_for_groups(
-        prepared,
-        plan,
-        group_heads=group_heads,
-        summary_group_chunks=summary_group_chunks,
-    )
-    summary_memory_config = _group_summary_memory_config(prepared.v_beta.device(), group_heads, plan.key_dim)
-    summary_a, summary_b = _summarize_chunk_groups(
-        grouped,
-        plan,
-        identity_tile=identity_tile,
-        summary_memory_config=summary_memory_config,
-        affine_summary_dtype=affine_summary_dtype,
-        compute_kernel_config=compute_kernel_config,
-    )
-    group_initial_states, distributed_final_state = _compute_group_entry_states(
-        summary_a,
-        summary_b,
-        initial_state,
-        plan,
-        groups_per_head=groups_per_head,
-        sequence_parallel_axis=sequence_parallel_axis,
-        output_memory_config=output_memory_config,
-        affine_summary_dtype=affine_summary_dtype,
-        recurrent_state_dtype=recurrent_state_dtype,
-        compute_kernel_config=affine_prefix_compute_kernel_config,
-    )
-    grouped_output, grouped_final_states = ttnn.transformer.kda_final_chunk_scan(
-        *grouped.as_kernel_args(),
-        initial_state=group_initial_states,
-        chunk_size=plan.chunk_size,
-        memory_config=output_memory_config,
-        compute_kernel_config=grouped_scan_compute_kernel_config,
-        output_bf16=grouped_scan_output_dtype == ttnn.bfloat16,
-    )
-    output = ttnn.reshape(
-        grouped_output,
-        (plan.batch_heads, plan.num_chunks, plan.chunk_size, plan.value_dim),
-    )
-    if distributed_final_state is not None:
-        final_state = distributed_final_state
-    else:
-        all_final_states = ttnn.reshape(
-            grouped_final_states,
-            (plan.batch_heads, groups_per_head, plan.key_dim, plan.value_dim),
-        )
-        last_final_state = ttnn.slice(
-            all_final_states,
-            (0, groups_per_head - 1, 0, 0),
-            (plan.batch_heads, groups_per_head, plan.key_dim, plan.value_dim),
-            memory_config=output_memory_config,
-        )
-        final_state = ttnn.reshape(last_final_state, (plan.batch_heads, plan.key_dim, plan.value_dim))
-    return _ScanResult(output=output, final_state=final_state)
+) -> _RecurrenceScan:
+    if sequence_parallel_axis is not None:
+        return _DistributedGroupedScan(sequence_parallel_axis)
+    if num_chunks >= _MIN_CHUNKS_FOR_GROUPED_SCAN and num_chunks % summary_group_chunks == 0:
+        return _LocalGroupedScan()
+    return _DirectScan()
 
 
 def _restore_recurrence_output(
     scan: _ScanResult,
-    plan: _RecurrencePlan,
+    geometry: _RecurrenceGeometry,
     *,
     output_final_state: bool,
     output_head_major: bool,
 ) -> tuple[ttnn.Tensor, ttnn.Tensor | None]:
     final_state = (
-        ttnn.reshape(scan.final_state, (plan.batch, plan.heads, plan.key_dim, plan.value_dim))
+        ttnn.reshape(
+            scan.final_state,
+            (geometry.batch, geometry.heads, geometry.key_dim, geometry.value_dim),
+        )
         if output_final_state
         else None
     )
     if output_head_major:
-        if plan.pad == 0:
-            return ttnn.reshape(scan.output, (plan.batch_heads, plan.sequence, plan.value_dim)), final_state
+        if geometry.pad == 0:
+            return ttnn.reshape(scan.output, (geometry.batch_heads, geometry.sequence, geometry.value_dim)), final_state
         output = ttnn.to_layout(scan.output, ttnn.ROW_MAJOR_LAYOUT)
-        output = ttnn.reshape(output, (plan.batch_heads, plan.padded_sequence, plan.value_dim))
-        output = ttnn.slice(output, (0, 0, 0), (plan.batch_heads, plan.sequence, plan.value_dim))
+        output = ttnn.reshape(output, (geometry.batch_heads, geometry.padded_sequence, geometry.value_dim))
+        output = ttnn.slice(output, (0, 0, 0), (geometry.batch_heads, geometry.sequence, geometry.value_dim))
         return ttnn.to_layout(output, ttnn.TILE_LAYOUT), final_state
 
     output = ttnn.to_layout(scan.output, ttnn.ROW_MAJOR_LAYOUT)
-    output = ttnn.reshape(output, (plan.batch_heads, plan.padded_sequence, plan.value_dim))
-    if plan.pad:
-        output = ttnn.slice(output, (0, 0, 0), (plan.batch_heads, plan.sequence, plan.value_dim))
-    output = ttnn.reshape(output, (plan.batch, plan.heads, plan.sequence, plan.value_dim))
+    output = ttnn.reshape(output, (geometry.batch_heads, geometry.padded_sequence, geometry.value_dim))
+    if geometry.pad:
+        output = ttnn.slice(output, (0, 0, 0), (geometry.batch_heads, geometry.sequence, geometry.value_dim))
+    output = ttnn.reshape(output, (geometry.batch, geometry.heads, geometry.sequence, geometry.value_dim))
     output = ttnn.permute(output, (0, 2, 1, 3))
     return output, final_state
 
@@ -713,8 +794,8 @@ def chunk_recurrence(
     grouped_scan_compute_kernel_config: ttnn.DeviceComputeKernelConfig | None = None,
     use_bf16_prep_intermediates: bool = False,
 ) -> tuple[ttnn.Tensor, ttnn.Tensor | None]:
-    """Run KDA chunk recurrence while keeping its state-flow stages explicit."""
-    plan = _validate_and_plan_recurrence(
+    """Run KDA chunk recurrence through the selected scan implementation."""
+    geometry = _validate_recurrence_geometry(
         q_input,
         k_input,
         v_input,
@@ -727,7 +808,22 @@ def chunk_recurrence(
         recurrent_state_dtype=recurrent_state_dtype,
         grouped_scan_output_dtype=grouped_scan_output_dtype,
     )
-    qk_scale = plan.key_dim**-0.5 if scale is None else scale
+    scan_strategy = _select_scan(
+        num_chunks=geometry.num_chunks,
+        summary_group_chunks=summary_group_chunks,
+        sequence_parallel_axis=sequence_parallel_axis,
+    )
+    scan_config = _ScanConfig(
+        summary_group_chunks=summary_group_chunks,
+        output_memory_config=_output_memory_config(memory_config),
+        compute_kernel_config=compute_kernel_config,
+        affine_summary_dtype=affine_summary_dtype,
+        recurrent_state_dtype=recurrent_state_dtype,
+        affine_prefix_compute_kernel_config=affine_prefix_compute_kernel_config,
+        grouped_scan_output_dtype=grouped_scan_output_dtype,
+        grouped_scan_compute_kernel_config=grouped_scan_compute_kernel_config,
+    )
+    qk_scale = geometry.key_dim**-0.5 if scale is None else scale
     device = q_input.device()
     inputs = _prepare_chunk_inputs(
         q_input,
@@ -735,48 +831,24 @@ def chunk_recurrence(
         v_input,
         gate_input,
         beta_input,
-        plan,
+        geometry,
         qk_scale=qk_scale,
     )
     constants = _resolve_chunk_constants(device, eye=eye, tril=tril, ones=ones, masks=masks)
-    state = _prepare_initial_state(initial_state, plan, device=device)
-    output_memory_config = _output_memory_config(memory_config)
+    state = _prepare_initial_state(initial_state, geometry, device=device)
     prepared = _prepare_chunk_terms(
         inputs,
         constants,
-        plan,
+        geometry,
         qk_scale=qk_scale,
+        memory_config=scan_strategy.preparation_memory_config,
         compute_kernel_config=compute_kernel_config,
         use_bf16_prep_intermediates=use_bf16_prep_intermediates,
     )
-
-    if plan.strategy is _ScanStrategy.DIRECT:
-        scan = _scan_chunks_direct(
-            prepared,
-            state,
-            plan,
-            memory_config=output_memory_config,
-            compute_kernel_config=compute_kernel_config,
-        )
-    else:
-        scan = _scan_chunk_groups(
-            prepared,
-            state,
-            constants[0],
-            plan,
-            summary_group_chunks=summary_group_chunks,
-            sequence_parallel_axis=sequence_parallel_axis,
-            output_memory_config=output_memory_config,
-            compute_kernel_config=compute_kernel_config,
-            affine_summary_dtype=affine_summary_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
-            affine_prefix_compute_kernel_config=affine_prefix_compute_kernel_config,
-            grouped_scan_output_dtype=grouped_scan_output_dtype,
-            grouped_scan_compute_kernel_config=grouped_scan_compute_kernel_config,
-        )
+    scan = scan_strategy.run(prepared, state, constants[0], geometry, scan_config)
     return _restore_recurrence_output(
         scan,
-        plan,
+        geometry,
         output_final_state=output_final_state,
         output_head_major=output_head_major,
     )
