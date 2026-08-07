@@ -133,16 +133,11 @@ class ttKDA:
         tp_axis: int = 1,
         topology: ttnn.Topology | None = None,
         program_config: KDAProgramConfig | None = None,
-        summary_group_chunks: int | None = None,
         weights: KDAWeights | None = None,
     ) -> None:
         if tp_axis not in (0, 1) or sp_axis not in (0, 1) or sp_axis == tp_axis:
             raise ValueError(f"KDA requires distinct 2D SP/TP axes, got SP={sp_axis}, TP={tp_axis}")
         program_config = program_config or KDAProgramConfig()
-        if summary_group_chunks is None:
-            summary_group_chunks = program_config.summary_group_chunks
-        if summary_group_chunks <= 0:
-            raise ValueError(f"summary_group_chunks must be positive, got {summary_group_chunks}")
         self.device = mesh_device
         self.layer_idx = layer_idx
         self.tensor_parallel_axis = tp_axis
@@ -150,19 +145,15 @@ class ttKDA:
         self.sequence_parallel_size = (
             tuple(mesh_device.shape)[self.sequence_parallel_axis] if isinstance(mesh_device, ttnn.MeshDevice) else 1
         )
-        self.summary_group_chunks = summary_group_chunks
+        self.recurrence_config = program_config.recurrence
         self.output_projection_out_block_w = program_config.output_projection_out_block_w
         output_grid = mesh_device.compute_with_storage_grid_size()
         self.output_projection_grid = (output_grid.x, output_grid.y)
-        self.recurrent_state_dtype = program_config.recurrent_state_dtype
         self.tp_ccl_topology = (
             topology
             if topology is not None
             else (ttnn.Topology.Ring if self.sequence_parallel_size == 1 else ttnn.Topology.Linear)
         )
-        self.affine_summary_dtype = program_config.affine_summary_dtype
-        self.grouped_scan_output_dtype = program_config.grouped_scan_output_dtype
-        self.use_bf16_prep_intermediates = program_config.use_bf16_prep_intermediates
         self.gated_rms_output_dtype = program_config.gated_rms_output_dtype
         if weights is not None and state_dict:
             raise ValueError("pass either constructed KDAWeights or host state_dict, not both")
@@ -195,7 +186,7 @@ class ttKDA:
         if self.tensor_parallel_size > 1 and tt_ccl is None:
             raise ValueError("tt_ccl is required for tensor-parallel KDA")
         self.tt_ccl = tt_ccl
-        self.chunk_const_tiles = build_kda_const_tiles(mesh_device)
+        self.chunk_constants = ops._ChunkConstants(*build_kda_const_tiles(mesh_device))
         self.compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
             math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -204,15 +195,20 @@ class ttKDA:
         )
         self.affine_prefix_compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
-            math_fidelity=program_config.affine_prefix_math_fidelity,
+            math_fidelity=self.recurrence_config.affine_prefix_math_fidelity,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
         )
         self.grouped_scan_compute_config = ttnn.init_device_compute_kernel_config(
             mesh_device.arch(),
-            math_fidelity=program_config.grouped_scan_math_fidelity,
+            math_fidelity=self.recurrence_config.grouped_scan_math_fidelity,
             fp32_dest_acc_en=True,
             packer_l1_acc=True,
+        )
+        self.recurrence_compute_config = ops._RecurrenceComputeConfig(
+            preparation=self.compute_config,
+            affine_prefix=self.affine_prefix_compute_config,
+            grouped_scan=self.grouped_scan_compute_config,
         )
         # Real-K3 component A/B: output-projection HiFi2 retained PCC >=0.999987 for every LoudBox
         # layout and improved median component latency by 3.580%-5.165%.
@@ -234,10 +230,10 @@ class ttKDA:
         return KdaState(
             recurrent=ttnn.zeros(
                 (batch_size, self.config.num_heads, self.config.head_k_dim, self.config.head_v_dim),
-                dtype=self.recurrent_state_dtype,
+                dtype=self.recurrence_config.recurrent_state_dtype,
                 layout=ttnn.TILE_LAYOUT,
                 device=self.device,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                memory_config=self.recurrence_config.output_memory_config,
             ),
             convolution=ttnn.zeros(
                 (batch_size, self.config.conv_kernel_size - 1, self._convolution_width),
@@ -261,14 +257,17 @@ class ttKDA:
         sequence = hidden_states.shape[1]
         if batch != 1:
             raise ValueError(f"KDA prefill currently requires batch size 1, got B={batch}")
-        if sequence <= 0 or sequence % ttnn.TILE_SIZE != 0:
-            raise ValueError(f"KDA prefill requires local T to be positive and divisible by 32, got T={sequence}")
+        chunk_size = self.recurrence_config.chunk_size
+        if sequence <= 0 or sequence % chunk_size != 0:
+            raise ValueError(
+                f"KDA prefill requires local T to be positive and divisible by {chunk_size}, got T={sequence}"
+            )
         if self.sequence_parallel_size > 1:
-            local_chunks = sequence // ttnn.TILE_SIZE
-            if local_chunks % self.summary_group_chunks != 0:
+            local_chunks = sequence // chunk_size
+            if local_chunks % self.recurrence_config.summary_group_chunks != 0:
                 raise ValueError(
                     f"local chunk count {local_chunks} must be divisible by "
-                    f"summary_group_chunks {self.summary_group_chunks}"
+                    f"summary_group_chunks {self.recurrence_config.summary_group_chunks}"
                 )
         expected_recurrent = (batch, self.config.num_heads, self.config.head_k_dim, self.config.head_v_dim)
         expected_convolution = (batch, self.config.conv_kernel_size - 1, self._convolution_width)
@@ -276,8 +275,10 @@ class ttKDA:
             raise ValueError(f"recurrent state shape {tuple(state.recurrent.shape)} != {expected_recurrent}")
         if tuple(state.convolution.shape) != expected_convolution:
             raise ValueError(f"convolution state shape {tuple(state.convolution.shape)} != {expected_convolution}")
-        if state.recurrent.dtype != self.recurrent_state_dtype:
-            raise ValueError(f"recurrent state dtype {state.recurrent.dtype} != {self.recurrent_state_dtype}")
+        if state.recurrent.dtype != self.recurrence_config.recurrent_state_dtype:
+            raise ValueError(
+                f"recurrent state dtype {state.recurrent.dtype} != {self.recurrence_config.recurrent_state_dtype}"
+            )
         if state.convolution.dtype != ttnn.bfloat16 or state.convolution.layout != ttnn.ROW_MAJOR_LAYOUT:
             raise ValueError("convolution state must be BF16 row-major")
         return batch, sequence
@@ -368,7 +369,13 @@ class ttKDA:
     ) -> _KDAInputs:
         """Evaluate decay and write gates while preserving the output gate for the epilogue."""
         config, weights = self.config, self.weights
-        beta = ttnn.sigmoid(beta, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        beta = ttnn.sigmoid(beta, memory_config=self.recurrence_config.output_memory_config)
+        # Precision boundary: the preparation leaf requires FP32 beta.
+        beta_for_recurrence = ttnn.typecast(
+            beta,
+            self.recurrence_config.beta_dtype,
+            memory_config=self.recurrence_config.output_memory_config,
+        )
         gate = ttnn.linear(
             decay_rank,
             weights.decay_output_projection,
@@ -398,9 +405,39 @@ class ttKDA:
             k=k,
             v=v,
             decay=gate,
-            beta=beta,
+            beta=beta_for_recurrence,
             output_gate=output_gate,
         )
+
+    def _assert_flat_recurrence_contract(
+        self,
+        inputs: _KDAInputs,
+        recurrent_state: ttnn.Tensor,
+    ) -> None:
+        """Assert postconditions of the internal recurrence producers."""
+        batch, sequence, heads = inputs.beta.shape
+        key_width = heads * self.config.head_k_dim
+        value_width = heads * self.config.head_v_dim
+        assert tuple(inputs.q.shape) == (batch, sequence, key_width)
+        assert tuple(inputs.k.shape) == (batch, sequence, key_width)
+        assert tuple(inputs.v.shape) == (batch, sequence, value_width)
+        assert tuple(inputs.decay.shape) == (batch, sequence, key_width)
+        assert tuple(recurrent_state.shape) == (
+            batch,
+            heads,
+            self.config.head_k_dim,
+            self.config.head_v_dim,
+        )
+        for tensor in (inputs.q, inputs.k, inputs.v):
+            assert tensor.dtype == self.recurrence_config.qkv_dtype
+            assert tensor.layout == ttnn.TILE_LAYOUT
+        assert inputs.decay.dtype == self.recurrence_config.gate_dtype
+        assert inputs.decay.layout == ttnn.TILE_LAYOUT
+        assert inputs.beta.dtype == self.recurrence_config.beta_dtype
+        assert inputs.beta.layout == ttnn.TILE_LAYOUT
+        assert recurrent_state.dtype == self.recurrence_config.recurrent_state_dtype
+        assert recurrent_state.layout == ttnn.TILE_LAYOUT
+        assert recurrent_state.memory_config() == self.recurrence_config.output_memory_config
 
     def _kda_prefill(
         self,
@@ -408,45 +445,23 @@ class ttKDA:
         recurrent_state: ttnn.Tensor,
     ) -> tuple[ttnn.Tensor, ttnn.Tensor]:
         """Run the KDA recurrence and return its raw output and updated state."""
-        q, k = inputs.q, inputs.k
-        key_dim = q.shape[-1] // inputs.beta.shape[-1]
-        output, new_recurrent_state = ops.chunk_recurrence(
-            q,
-            k,
-            inputs.v,
-            inputs.decay,
-            inputs.beta,
-            scale=key_dim**-0.5,
-            initial_state=recurrent_state,
-            output_final_state=True,
-            output_head_major=True,
-            chunk_size=32,
-            memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            eye=self.chunk_const_tiles[0],
-            tril=self.chunk_const_tiles[1],
-            ones=self.chunk_const_tiles[2],
-            masks=self.chunk_const_tiles[3],
-            summary_group_chunks=self.summary_group_chunks,
-            sequence_parallel_axis=(self.sequence_parallel_axis if self.sequence_parallel_size > 1 else None),
-            # Real-K3 component A/B: BF16 affine-summary storage retained PCC 0.999429/0.999545/0.999702
-            # for SP1xTP8/SP2xTP4/SP4xTP2, with <=0.687% median and <=0.858% 95% UCB latency cost.
-            affine_summary_dtype=self.affine_summary_dtype,
-            recurrent_state_dtype=self.recurrent_state_dtype,
-            # Real-K3 component A/B: affine-prefix HiFi2 retained PCC 1.0 for every LoudBox layout;
-            # median latency changed -0.228%/+0.299%/-0.276% for SP1xTP8/SP2xTP4/SP4xTP2.
-            affine_prefix_compute_kernel_config=self.affine_prefix_compute_config,
-            # Real-K3 component A/B: BF16 grouped-scan output retained PCC >=0.999984 for every
-            # LoudBox layout and improved median component latency by 0.199%-0.347%.
-            grouped_scan_output_dtype=self.grouped_scan_output_dtype,
-            # Real-K3 component A/B: grouped final-scan HiFi2 retained PCC >=0.995789 for every
-            # LoudBox layout; median latency changed -0.365%/-0.473%/+0.094% for SP1xTP8/SP2xTP4/SP4xTP2.
-            grouped_scan_compute_kernel_config=self.grouped_scan_compute_config,
-            use_bf16_prep_intermediates=self.use_bf16_prep_intermediates,
+        self._assert_flat_recurrence_contract(inputs, recurrent_state)
+        recurrence_inputs = ops._FlatRecurrenceInputs(
+            q=inputs.q,
+            k=inputs.k,
+            v=inputs.v,
+            gate=inputs.decay,
+            beta=inputs.beta,
         )
-        assert new_recurrent_state is not None
-        if new_recurrent_state.dtype != self.recurrent_state_dtype:
-            new_recurrent_state = ttnn.typecast(new_recurrent_state, self.recurrent_state_dtype)
-        return output, new_recurrent_state
+        result = ops._chunk_recurrence(
+            recurrence_inputs,
+            recurrent_state,
+            self.chunk_constants,
+            program_config=self.recurrence_config,
+            compute_config=self.recurrence_compute_config,
+            sequence_parallel_axis=(self.sequence_parallel_axis if self.sequence_parallel_size > 1 else None),
+        )
+        return result.output, result.final_state
 
     def _kda_rms_norm(
         self,
@@ -481,8 +496,7 @@ class ttKDA:
         output = ttnn.reshape(output, (batch, sequence, config.v_dim))
         if self.tensor_parallel_size > 1:
             assert self.tt_ccl is not None
-            if output.dtype != ttnn.bfloat16:
-                output = ttnn.typecast(output, ttnn.bfloat16, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            assert output.dtype == self.gated_rms_output_dtype
             output = ttnn.reshape(output, (1, batch, sequence, config.v_dim))
             output = ttnn.linear(
                 output,

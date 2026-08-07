@@ -9,6 +9,7 @@ import torch
 
 import ttnn
 from models.common.utility_functions import run_for_blackhole
+from models.demos.deepseek_v3_d_p.reference.kda.config import KDARecurrenceProgramConfig
 from models.demos.deepseek_v3_d_p.tests.kda.utils import assert_accurate, assert_bit_identical
 from models.demos.deepseek_v3_d_p.tt.kda import ops
 
@@ -91,8 +92,8 @@ def _partitioned_to_torch(
         for tp_rank in range(tp_size):
             row, column = _coordinate(sp_rank, tp_rank, sp_axis)
             head_shards.append(shards[row * columns + column])
-        partitions.append(torch.cat(head_shards, dim=1))
-    return torch.cat(partitions, dim=0)
+        partitions.append(torch.cat(head_shards, dim=0))
+    return torch.stack(partitions, dim=0)
 
 
 def _replicated_sp_to_torch(
@@ -108,36 +109,18 @@ def _replicated_sp_to_torch(
     for tp_rank in range(tp_size):
         row, column = _coordinate(0, tp_rank, sp_axis)
         head_shards.append(shards[row * columns + column])
-    return torch.cat(head_shards, dim=1)
-
-
-def _all_gather_oracle(
-    transform_a: ttnn.Tensor,
-    transform_b: ttnn.Tensor,
-    initial_state: torch.Tensor,
-    mesh_device: ttnn.MeshDevice,
-    sp_axis: int,
-    tp_axis: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    gathered_a = ttnn.all_gather(transform_a, dim=0, cluster_axis=sp_axis, topology=ttnn.Topology.Linear)
-    gathered_b = ttnn.all_gather(transform_b, dim=0, cluster_axis=sp_axis, topology=ttnn.Topology.Linear)
-    host_a = _replicated_sp_to_torch(gathered_a, mesh_device, sp_axis, tp_axis)
-    host_b = _replicated_sp_to_torch(gathered_b, mesh_device, sp_axis, tp_axis)
-    return _serial_prefix(host_a, host_b, initial_state)
+    return torch.cat(head_shards, dim=0)
 
 
 @pytest.mark.parametrize("tensor_parallel_axis", [0, 1])
-@pytest.mark.parametrize("affine_summary_dtype", [ttnn.float32, ttnn.bfloat16])
-@pytest.mark.parametrize("recurrent_state_dtype", [ttnn.float32, ttnn.bfloat16])
-def test_distributed_affine_prefix_matches_serial_and_all_gather(
+def test_distributed_affine_prefix_matches_serial(
     mesh_device: ttnn.MeshDevice,
     tensor_parallel_axis: int,
-    affine_summary_dtype: ttnn.DataType,
-    recurrent_state_dtype: ttnn.DataType,
 ) -> None:
     sp_axis = 1 - tensor_parallel_axis
     sp_size = tuple(mesh_device.shape)[sp_axis]
     heads = 8
+    local_heads = heads // tuple(mesh_device.shape)[tensor_parallel_axis]
     dim = 32
     generator = torch.Generator().manual_seed(621 + tensor_parallel_axis)
     eye = torch.eye(dim, dtype=torch.float32).reshape(1, 1, dim, dim)
@@ -147,49 +130,53 @@ def test_distributed_affine_prefix_matches_serial_and_all_gather(
     initial_state = 0.01 * torch.randn(heads, dim, dim, generator=generator)
 
     summary_dims = [None, None]
-    summary_dims[sp_axis] = 0
     summary_dims[tensor_parallel_axis] = 1
     state_dims = [None, None]
-    state_dims[tensor_parallel_axis] = 1
-    a_tt = _to_device(transform_a, mesh_device, tuple(summary_dims), affine_summary_dtype)
-    b_tt = _to_device(transform_b, mesh_device, tuple(summary_dims), affine_summary_dtype)
-    state_tt = _to_device(initial_state.unsqueeze(0), mesh_device, tuple(state_dims), recurrent_state_dtype)
+    state_dims[tensor_parallel_axis] = 0
+    replicated_a = _to_device(transform_a, mesh_device, tuple(summary_dims))
+    replicated_b = _to_device(transform_b, mesh_device, tuple(summary_dims))
+    a_tt = ttnn.reshape(ttnn.mesh_partition(replicated_a, dim=0, cluster_axis=sp_axis), (local_heads, dim, dim))
+    b_tt = ttnn.reshape(ttnn.mesh_partition(replicated_b, dim=0, cluster_axis=sp_axis), (local_heads, dim, dim))
+    state_tt = _to_device(initial_state, mesh_device, tuple(state_dims))
 
     expected_entries, expected_final = _serial_prefix(transform_a, transform_b, initial_state)
-    oracle_entries, oracle_final = _all_gather_oracle(
-        a_tt, b_tt, initial_state, mesh_device, sp_axis, tensor_parallel_axis
+    program_config = KDARecurrenceProgramConfig()
+    compute_config = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=program_config.affine_prefix_math_fidelity,
+        fp32_dest_acc_en=True,
     )
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        entry_tt, final_tt = ops.distributed_affine_prefix(
+        entry_tt, final_tt = ops._distributed_affine_prefix(
             a_tt,
             b_tt,
             state_tt,
             sequence_parallel_axis=sp_axis,
-            affine_summary_dtype=affine_summary_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
+            program_config=program_config,
+            compute_config=compute_config,
         )
     cache_entries = mesh_device.num_program_cache_entries()
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        repeated_entry_tt, repeated_final_tt = ops.distributed_affine_prefix(
+        repeated_entry_tt, repeated_final_tt = ops._distributed_affine_prefix(
             a_tt,
             b_tt,
             state_tt,
             sequence_parallel_axis=sp_axis,
-            affine_summary_dtype=affine_summary_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
+            program_config=program_config,
+            compute_config=compute_config,
         )
     ttnn.synchronize_device(mesh_device)
     assert mesh_device.num_program_cache_entries() == cache_entries
 
     trace_id = ttnn.begin_trace_capture(mesh_device, cq_id=0)
     with ttnn.manage_config("throw_exception_on_fallback", True):
-        traced_entry_tt, traced_final_tt = ops.distributed_affine_prefix(
+        traced_entry_tt, traced_final_tt = ops._distributed_affine_prefix(
             a_tt,
             b_tt,
             state_tt,
             sequence_parallel_axis=sp_axis,
-            affine_summary_dtype=affine_summary_dtype,
-            recurrent_state_dtype=recurrent_state_dtype,
+            program_config=program_config,
+            compute_config=compute_config,
         )
     ttnn.end_trace_capture(mesh_device, trace_id, cq_id=0)
     # Exercise the cached trace enough times to expose cross-rank CB reuse races.
@@ -205,17 +192,15 @@ def test_distributed_affine_prefix_matches_serial_and_all_gather(
     traced_final = _replicated_sp_to_torch(traced_final_tt, mesh_device, sp_axis, tensor_parallel_axis)
     ttnn.release_trace(mesh_device, trace_id)
 
-    assert entry_tt.dtype == recurrent_state_dtype
-    assert final_tt.dtype == recurrent_state_dtype
+    assert entry_tt.dtype == program_config.recurrent_state_dtype
+    assert final_tt.dtype == program_config.recurrent_state_dtype
 
-    assert_accurate(expected_entries, oracle_entries, name=f"tp_axis={tensor_parallel_axis} oracle entries")
-    assert_accurate(expected_final, oracle_final, name=f"tp_axis={tensor_parallel_axis} oracle final")
     assert_accurate(expected_entries, actual_entries, name=f"tp_axis={tensor_parallel_axis} production entries")
-    assert_accurate(expected_final, actual_final, name=f"tp_axis={tensor_parallel_axis} production final")
+    assert_accurate(expected_final.squeeze(0), actual_final, name=f"tp_axis={tensor_parallel_axis} production final")
     assert_accurate(expected_entries, repeated_entries, name=f"tp_axis={tensor_parallel_axis} repeated entries")
-    assert_accurate(expected_final, repeated_final, name=f"tp_axis={tensor_parallel_axis} repeated final")
+    assert_accurate(expected_final.squeeze(0), repeated_final, name=f"tp_axis={tensor_parallel_axis} repeated final")
     assert_accurate(expected_entries, traced_entries, name=f"tp_axis={tensor_parallel_axis} traced entries")
-    assert_accurate(expected_final, traced_final, name=f"tp_axis={tensor_parallel_axis} traced final")
+    assert_accurate(expected_final.squeeze(0), traced_final, name=f"tp_axis={tensor_parallel_axis} traced final")
 
 
 @pytest.mark.parametrize("tensor_parallel_axis", [0, 1])
@@ -226,6 +211,7 @@ def test_distributed_affine_prefix_determinism(
     sp_axis = 1 - tensor_parallel_axis
     sp_size = tuple(mesh_device.shape)[sp_axis]
     heads, dim = 8, 32
+    local_heads = heads // tuple(mesh_device.shape)[tensor_parallel_axis]
     generator = torch.Generator().manual_seed(1621 + tensor_parallel_axis)
     eye = torch.eye(dim, dtype=torch.float32).reshape(1, 1, dim, dim)
     transform_a = (0.91 * eye).expand(sp_size, heads, -1, -1).clone()
@@ -233,17 +219,31 @@ def test_distributed_affine_prefix_determinism(
     transform_b = 0.01 * torch.randn(sp_size, heads, dim, dim, generator=generator)
     initial_state = 0.01 * torch.randn(heads, dim, dim, generator=generator)
     summary_dims = [None, None]
-    summary_dims[sp_axis] = 0
     summary_dims[tensor_parallel_axis] = 1
     state_dims = [None, None]
-    state_dims[tensor_parallel_axis] = 1
-    a_tt = _to_device(transform_a, mesh_device, tuple(summary_dims))
-    b_tt = _to_device(transform_b, mesh_device, tuple(summary_dims))
-    state_tt = _to_device(initial_state.unsqueeze(0), mesh_device, tuple(state_dims))
+    state_dims[tensor_parallel_axis] = 0
+    replicated_a = _to_device(transform_a, mesh_device, tuple(summary_dims))
+    replicated_b = _to_device(transform_b, mesh_device, tuple(summary_dims))
+    a_tt = ttnn.reshape(ttnn.mesh_partition(replicated_a, dim=0, cluster_axis=sp_axis), (local_heads, dim, dim))
+    b_tt = ttnn.reshape(ttnn.mesh_partition(replicated_b, dim=0, cluster_axis=sp_axis), (local_heads, dim, dim))
+    state_tt = _to_device(initial_state, mesh_device, tuple(state_dims))
+    program_config = KDARecurrenceProgramConfig()
+    compute_config = ttnn.init_device_compute_kernel_config(
+        mesh_device.arch(),
+        math_fidelity=program_config.affine_prefix_math_fidelity,
+        fp32_dest_acc_en=True,
+    )
 
     results = []
     for _ in range(3):
-        entry_tt, final_tt = ops.distributed_affine_prefix(a_tt, b_tt, state_tt, sequence_parallel_axis=sp_axis)
+        entry_tt, final_tt = ops._distributed_affine_prefix(
+            a_tt,
+            b_tt,
+            state_tt,
+            sequence_parallel_axis=sp_axis,
+            program_config=program_config,
+            compute_config=compute_config,
+        )
         ttnn.synchronize_device(mesh_device)
         results.append(
             (

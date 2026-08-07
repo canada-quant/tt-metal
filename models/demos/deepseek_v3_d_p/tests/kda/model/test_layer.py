@@ -158,10 +158,7 @@ def test_segmented_prefill_cache_continuity(device: ttnn.Device) -> None:
     assert_accurate(golden_convolution, actual_convolution, name="cache convolution state", pcc_threshold=0.98)
 
 
-@pytest.mark.parametrize("recurrent_state_dtype", [ttnn.float32, ttnn.bfloat16])
-def test_explicit_state_is_replaced_without_mutating_input(
-    device: ttnn.Device, recurrent_state_dtype: ttnn.DataType
-) -> None:
+def test_explicit_fp32_state_is_replaced_without_mutating_input(device: ttnn.Device) -> None:
     config = make_config()
     weights = random_weights(config)
     hidden = torch.randn(
@@ -176,7 +173,7 @@ def test_explicit_state_is_replaced_without_mutating_input(
         device,
         config,
         weights,
-        program_config=make_program_config(recurrent_state_dtype=recurrent_state_dtype),
+        program_config=make_program_config(),
     )
     input_state = layer.allocate_state()
     external_recurrent = input_state.recurrent
@@ -191,7 +188,7 @@ def test_explicit_state_is_replaced_without_mutating_input(
     assert input_state.convolution is external_convolution
     assert input_state.recurrent.buffer_address() == recurrent_address
     assert input_state.convolution.buffer_address() == convolution_address
-    assert next_state.recurrent.dtype == recurrent_state_dtype
+    assert next_state.recurrent.dtype == ttnn.float32
     actual_recurrent = ttnn.to_torch(next_state.recurrent)
     actual_convolution = ttnn.to_torch(next_state.convolution)
     golden_convolution = torch.cat(
@@ -202,18 +199,17 @@ def test_explicit_state_is_replaced_without_mutating_input(
         ),
         dim=-1,
     )
-    dtype_name = str(recurrent_state_dtype)
-    assert_accurate(golden_output, actual_output, name=f"external {dtype_name} output", pcc_threshold=0.98)
+    assert_accurate(golden_output, actual_output, name="external FP32 output", pcc_threshold=0.98)
     assert_accurate(
         golden_state.recurrent,
         actual_recurrent,
-        name=f"external {dtype_name} recurrent state",
+        name="external FP32 recurrent state",
         pcc_threshold=0.98,
     )
     assert_accurate(
         golden_convolution,
         actual_convolution,
-        name=f"external {dtype_name} convolution state",
+        name="external BF16 convolution state",
         pcc_threshold=0.98,
     )
 

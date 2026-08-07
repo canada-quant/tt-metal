@@ -7,7 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 import ttnn
-from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig, KDAProgramConfig
+from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig, KDAProgramConfig, KDARecurrenceProgramConfig
 
 
 class KimiK3Config:
@@ -59,14 +59,11 @@ def kimi_k3_program_config(
     """Return measured K3 tuning with caller-owned per-axis CCL topology."""
     return KDAProgramConfig(
         # 160 local chunks / 20 = 8 groups/head; TP8 uses 12 * 8 = 96 owners.
-        summary_group_chunks=KimiK3Config.KDA_SUMMARY_GROUP_CHUNKS,
+        recurrence=KDARecurrenceProgramConfig(
+            summary_group_chunks=KimiK3Config.KDA_SUMMARY_GROUP_CHUNKS,
+        ),
         output_projection_out_block_w=KimiK3Config.KDA_OUTPUT_PROJECTION_OUT_BLOCK_W,
         tp_ccl_topology=tp_ccl_topology,
-        affine_summary_dtype=ttnn.bfloat16,
-        affine_prefix_math_fidelity=ttnn.MathFidelity.HiFi2,
-        grouped_scan_output_dtype=ttnn.bfloat16,
-        grouped_scan_math_fidelity=ttnn.MathFidelity.HiFi2,
-        use_bf16_prep_intermediates=True,
         gated_rms_output_dtype=ttnn.bfloat16,
         output_projection_math_fidelity=ttnn.MathFidelity.HiFi2,
     )

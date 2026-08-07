@@ -54,7 +54,7 @@ pytestmark = [
 
 _SEQUENCE = 5120
 _REPETITIONS = 10
-_TIMING_SAMPLES = 5
+_TIMING_SAMPLES = int(os.getenv("KDA_TIMING_SAMPLES", "5"))
 _PCC_THRESHOLD = 0.98
 _PERF_TARGETS_PATH = Path(__file__).parent / "perf_targets" / "bh_loudbox.json"
 _CPU_REFERENCE_CACHE_VERSION = 2

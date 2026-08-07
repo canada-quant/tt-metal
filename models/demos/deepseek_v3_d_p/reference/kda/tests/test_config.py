@@ -5,7 +5,7 @@
 import pytest
 
 import ttnn
-from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig, KDAProgramConfig
+from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig, KDAProgramConfig, KDARecurrenceProgramConfig
 from models.demos.deepseek_v3_d_p.reference.kimi_k3_config import (
     KimiK3Config,
     kimi_k3_kda_config,
@@ -51,32 +51,32 @@ def test_program_config_ccl_topology() -> None:
 
 
 def test_program_config_affine_summary_dtype() -> None:
-    assert KDAProgramConfig().affine_summary_dtype == ttnn.float32
-    assert kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).affine_summary_dtype == ttnn.bfloat16
+    assert KDAProgramConfig().recurrence.affine_summary_dtype == ttnn.bfloat16
+    assert kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).recurrence.affine_summary_dtype == ttnn.bfloat16
 
 
 def test_program_config_recurrent_state_dtype() -> None:
-    assert KDAProgramConfig().recurrent_state_dtype == ttnn.float32
-    assert kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).recurrent_state_dtype == ttnn.float32
+    assert KDAProgramConfig().recurrence.recurrent_state_dtype == ttnn.float32
+    assert kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).recurrence.recurrent_state_dtype == ttnn.float32
 
 
 def test_program_config_affine_prefix_math_fidelity() -> None:
-    assert KDAProgramConfig().affine_prefix_math_fidelity == ttnn.MathFidelity.HiFi4
+    assert KDAProgramConfig().recurrence.affine_prefix_math_fidelity == ttnn.MathFidelity.HiFi2
     assert (
-        kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).affine_prefix_math_fidelity
+        kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).recurrence.affine_prefix_math_fidelity
         == ttnn.MathFidelity.HiFi2
     )
 
 
 def test_program_config_grouped_scan_output_dtype() -> None:
-    assert KDAProgramConfig().grouped_scan_output_dtype == ttnn.float32
-    assert kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).grouped_scan_output_dtype == ttnn.bfloat16
+    assert KDAProgramConfig().recurrence.scan_output_dtype == ttnn.bfloat16
+    assert kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).recurrence.scan_output_dtype == ttnn.bfloat16
 
 
 def test_program_config_grouped_scan_math_fidelity() -> None:
-    assert KDAProgramConfig().grouped_scan_math_fidelity == ttnn.MathFidelity.HiFi4
+    assert KDAProgramConfig().recurrence.grouped_scan_math_fidelity == ttnn.MathFidelity.HiFi2
     assert (
-        kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).grouped_scan_math_fidelity
+        kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).recurrence.grouped_scan_math_fidelity
         == ttnn.MathFidelity.HiFi2
     )
 
@@ -92,6 +92,47 @@ def test_program_config_output_projection_math_fidelity() -> None:
         kimi_k3_program_config(tp_ccl_topology=ttnn.Topology.Linear).output_projection_math_fidelity
         == ttnn.MathFidelity.HiFi2
     )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("qkv_dtype", ttnn.float32),
+        ("gate_dtype", ttnn.float32),
+        ("beta_dtype", ttnn.bfloat16),
+        ("recurrent_state_dtype", ttnn.bfloat16),
+        ("affine_summary_dtype", ttnn.float32),
+        ("scan_output_dtype", ttnn.float32),
+    ],
+)
+def test_recurrence_config_rejects_noncanonical_dtype(field: str, value: ttnn.DataType, expect_error) -> None:
+    with expect_error(ValueError, field):
+        KDARecurrenceProgramConfig(**{field: value})
+
+
+def test_recurrence_config_uses_measured_memory_placements() -> None:
+    config = KDARecurrenceProgramConfig()
+
+    assert config.preparation_memory_config == ttnn.DRAM_MEMORY_CONFIG
+    assert config.prefix_memory_config == ttnn.DRAM_MEMORY_CONFIG
+    assert config.distributed_working_memory_config == ttnn.L1_MEMORY_CONFIG
+    assert config.output_memory_config == ttnn.DRAM_MEMORY_CONFIG
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("preparation_memory_config", ttnn.L1_MEMORY_CONFIG),
+        ("prefix_memory_config", ttnn.L1_MEMORY_CONFIG),
+        ("distributed_working_memory_config", ttnn.DRAM_MEMORY_CONFIG),
+        ("output_memory_config", ttnn.L1_MEMORY_CONFIG),
+    ],
+)
+def test_recurrence_config_rejects_unmeasured_memory_placement(
+    field: str, value: ttnn.MemoryConfig, expect_error
+) -> None:
+    with expect_error(ValueError, field):
+        KDARecurrenceProgramConfig(**{field: value})
 
 
 @pytest.mark.parametrize("field", ["hidden_size", "num_heads", "head_k_dim", "head_v_dim"])

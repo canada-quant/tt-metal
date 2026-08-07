@@ -10,7 +10,7 @@ import torch
 import ttnn
 from models.common.utility_functions import run_for_blackhole
 from models.demos.deepseek_v3_d_p.reference.kda import kda_forward_reference
-from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig, KDAProgramConfig
+from models.demos.deepseek_v3_d_p.reference.kda.config import KDAConfig, KDAProgramConfig, KDARecurrenceProgramConfig
 from models.demos.deepseek_v3_d_p.tests.kda.utils import (
     assert_accurate,
     assert_bit_identical,
@@ -72,11 +72,7 @@ def test_sp_layer_matches_serial_reference(
 
     sp_axis = 1 - tensor_parallel_axis
     program_config = KDAProgramConfig(
-        summary_group_chunks=8,
-        affine_summary_dtype=ttnn.bfloat16,
-        affine_prefix_math_fidelity=ttnn.MathFidelity.HiFi2,
-        grouped_scan_output_dtype=ttnn.bfloat16,
-        grouped_scan_math_fidelity=ttnn.MathFidelity.HiFi2,
+        recurrence=KDARecurrenceProgramConfig(summary_group_chunks=8),
         gated_rms_output_dtype=ttnn.bfloat16,
         output_projection_math_fidelity=ttnn.MathFidelity.HiFi2,
     )
@@ -177,7 +173,9 @@ def test_sp_chunked_prefill_matches_one_shot(
         tt_ccl=TT_CCL(mesh_device),
         sp_axis=sp_axis,
         tp_axis=tensor_parallel_axis,
-        summary_group_chunks=summary_group_chunks,
+        program_config=KDAProgramConfig(
+            recurrence=KDARecurrenceProgramConfig(summary_group_chunks=summary_group_chunks)
+        ),
     )
 
     one_shot_input_state = layer.allocate_state(batch_size=1)
@@ -280,7 +278,7 @@ def test_sp_layer_determinism(
         tt_ccl=TT_CCL(mesh_device),
         sp_axis=sp_axis,
         tp_axis=tensor_parallel_axis,
-        summary_group_chunks=1,
+        program_config=KDAProgramConfig(recurrence=KDARecurrenceProgramConfig(summary_group_chunks=1)),
     )
     hidden_tt = _to_sp_input(hidden, mesh_device, sp_axis)
     tp_size = tuple(mesh_device.shape)[tensor_parallel_axis]
