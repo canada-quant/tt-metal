@@ -19,6 +19,24 @@ pytestmark = [
 ]
 
 
+def test_chunk_scan_strategy_policy(device: ttnn.Device) -> None:
+    del device
+    cases = (
+        (159, 8, None, ops._ScanStrategy.DIRECT),
+        (160, 8, None, ops._ScanStrategy.GROUPED),
+        (161, 8, None, ops._ScanStrategy.DIRECT),
+        (8, 8, 0, ops._ScanStrategy.DISTRIBUTED_GROUPED),
+        (9, 8, 0, ops._ScanStrategy.DISTRIBUTED_GROUPED),
+    )
+    for num_chunks, group_chunks, sp_axis, expected in cases:
+        actual = ops._select_scan_strategy(
+            num_chunks=num_chunks,
+            summary_group_chunks=group_chunks,
+            sequence_parallel_axis=sp_axis,
+        )
+        assert actual is expected
+
+
 def _to_device(tensor: torch.Tensor, device: ttnn.Device, dtype: ttnn.DataType) -> ttnn.Tensor:
     return ttnn.from_torch(
         tensor,
