@@ -33,14 +33,13 @@ void kernel_main() {
     ///////////////////////////////////////////////////
     constexpr uint32_t output_chunk_size = get_compile_time_arg_val(0);
     constexpr uint32_t output_chunks_per_page = get_compile_time_arg_val(1);
-    constexpr uint32_t output_chunks_per_stripe = get_compile_time_arg_val(2);
-    constexpr uint32_t num_devices = get_compile_time_arg_val(3);
-    constexpr uint32_t cb0_id = get_compile_time_arg_val(4);
-    constexpr uint32_t cb_page_size = get_compile_time_arg_val(5);
-    constexpr uint32_t packet_size = get_compile_time_arg_val(6);
-    constexpr uint32_t data_valid_granularity = get_compile_time_arg_val(7);
-    constexpr uint32_t slice_step = get_compile_time_arg_val(8);
-    constexpr auto output_tensor_args = TensorAccessorArgs<9>();
+    constexpr uint32_t num_devices = get_compile_time_arg_val(2);
+    constexpr uint32_t cb0_id = get_compile_time_arg_val(3);
+    constexpr uint32_t cb_page_size = get_compile_time_arg_val(4);
+    constexpr uint32_t packet_size = get_compile_time_arg_val(5);
+    constexpr uint32_t data_valid_granularity = get_compile_time_arg_val(6);
+    constexpr uint32_t slice_step = get_compile_time_arg_val(7);
+    constexpr auto output_tensor_args = TensorAccessorArgs<8>();
 
     // The direct-EDM/mux path and mux geometry follow the tensor-accessor arguments.
     constexpr uint32_t mux_ct_base = output_tensor_args.next_compile_time_args_offset();
@@ -72,6 +71,7 @@ void kernel_main() {
     const uint32_t num_granular_sends = get_arg_val<uint32_t>(arg_idx++);  // leading sends the downstream relays
     [[maybe_unused]] const uint8_t neighbor_dev_id = get_arg_val<uint32_t>(arg_idx++);
     [[maybe_unused]] const uint16_t neighbor_mesh_id = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t output_chunks_per_stripe = get_arg_val<uint32_t>(arg_idx++);
     [[maybe_unused]] size_t arg_for_fab = arg_idx;  // fabric connection args start here (non-mux path)
 
     // A direction with no neighbor (a line endpoint) relays nothing; no fabric/mux connection was appended.
@@ -154,13 +154,7 @@ void kernel_main() {
         // MAIN
         ///////////////////////////////////////////////////
 
-        OutputStripeIterator<
-            output_chunks_per_stripe,
-            output_chunks_per_page,
-            output_chunk_size,
-            num_devices,
-            slice_step>
-            it;
+        OutputStripeIterator<output_chunks_per_page, output_chunk_size, num_devices, slice_step> it;
 
         uint32_t stripe = initial_stripe;
         for (uint32_t iter = 0; iter < num_iters; ++iter) {
@@ -169,7 +163,7 @@ void kernel_main() {
             const uint32_t count = last ? final_count : slice_count;
             const bool granular = (iter < num_granular_sends);  // downstream relays this stripe -> signal fine-grained
             const bool local_copy = (iter == 0) && (do_local_write != 0);
-            it.init(stripe, start, count);
+            it.init(stripe, start, count, output_chunks_per_stripe);
 
             uint32_t pending_chunks = 0, pending_pages = 0;
             for (uint32_t chunks_sent = 0; chunks_sent < count;) {

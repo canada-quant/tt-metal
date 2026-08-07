@@ -725,6 +725,68 @@ def test_high_bw_all_gather_512k_fabric_2d_line(mesh_device):
     _run_high_bw_all_gather_test_cases(rank_line, min_bandwidth_gbps=45.0, cluster_axis=cluster_axis)
 
 
+@pytest.mark.parametrize("device_params", [_FABRIC_2D_LINE_DEVICE_PARAMS], indirect=True)
+@run_for_blackhole("high_bw_all_gather selected-cache-slot coverage requires Blackhole")
+def test_high_bw_all_gather_selected_batch_prefix(mesh_device):
+    """One maximum-size output allocation can gather either cache slot and a shorter valid prefix."""
+    rank_line, cluster_axis = _rank_line_mesh(mesh_device)
+    axis_size = rank_line.shape[cluster_axis]
+    local_rows, active_local_rows, width = 1024, 512, 576
+    torch.manual_seed(0)
+    host_input = torch.rand((2, 1, local_rows * axis_size, width), dtype=torch.bfloat16)
+    device_input = _make_tensor(
+        rank_line,
+        host_input,
+        ttnn.bfloat16,
+        ttnn.ROW_MAJOR_LAYOUT,
+        ttnn.ShardTensor2dMesh(
+            rank_line,
+            dims=(2, None) if cluster_axis == 0 else (None, 2),
+            mesh_shape=tuple(rank_line.shape),
+        ),
+    )
+    persistent_output = _make_tensor(
+        rank_line,
+        torch.zeros((1, 1, local_rows * axis_size, width), dtype=torch.bfloat16),
+        ttnn.bfloat16,
+        ttnn.ROW_MAJOR_LAYOUT,
+        ttnn.ReplicateTensorToMesh(rank_line),
+    )
+
+    cache_entries_after_first = None
+    for batch_index, rows_this_call in ((0, active_local_rows), (1, active_local_rows // 2)):
+        ttnn.experimental.high_bw_all_gather(
+            device_input,
+            dim=2,
+            output_tensor=persistent_output,
+            cluster_axis=cluster_axis,
+            num_links=_NUM_LINKS,
+            input_batch_index=batch_index,
+            gathered_dim_size=rows_this_call * axis_size,
+        )
+        ttnn.synchronize_device(rank_line)
+        if cache_entries_after_first is None:
+            cache_entries_after_first = rank_line.num_program_cache_entries()
+        else:
+            assert rank_line.num_program_cache_entries() == cache_entries_after_first
+
+        # Runtime extents transfer only the valid prefix from every rank, but retain the
+        # maximum-size output's rank stride. This makes the output safe to reuse as an
+        # address-indexed cache without moving its later-rank pages on every call.
+        expected = torch.zeros((1, 1, local_rows * axis_size, width), dtype=torch.bfloat16)
+        for rank, shard in enumerate(ttnn.get_device_tensors(device_input)):
+            expected[:, :, rank * local_rows : rank * local_rows + rows_this_call, :] = ttnn.to_torch(shard)[
+                batch_index : batch_index + 1, :, :rows_this_call, :
+            ]
+        for output_shard in ttnn.get_device_tensors(persistent_output):
+            actual = ttnn.to_torch(output_shard)
+            for rank in range(axis_size):
+                start = rank * local_rows
+                assert torch.equal(
+                    actual[:, :, start : start + rows_this_call, :], expected[:, :, start : start + rows_this_call, :]
+                )
+
+
 @pytest.mark.parametrize("device_params", [_FABRIC_2D_TORUS_XY_DEVICE_PARAMS], indirect=True)
 def test_high_bw_all_gather_ragged_accuracy(mesh_device):
     if os.getenv("TT_METAL_HIGH_BW_ALL_GATHER_RUN_RAGGED_ACCURACY") != "1":
