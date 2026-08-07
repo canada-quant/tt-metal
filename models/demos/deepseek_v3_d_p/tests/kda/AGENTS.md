@@ -33,19 +33,12 @@ tests/
 │                                         long-running marker registration.
 ├── checkpoint_utils.py                 — Indexed Kimi-K3 layer loading for tests.
 ├── test_cache_fingerprints.py           — Persistent tensor and CPU-oracle cache identities.
+├── test_numeric_validation.py          — Accuracy, equality, bit-identity, and finiteness contracts.
 ├── utils.py                            — Three numeric contracts; case builders,
 │                                         reconstruction, and profiling support.
 ├── checkpoint/
 │   └── test_checkpoint.py              — Indexed-shard loading, failures, and weight
 │                                         validation, and padded K3 A_log normalization.
-├── reference/
-│   ├── test_config.py                  — Config mapping and validation contracts.
-│   ├── test_layer.py                   — Transition accuracy and optional bounded
-│   │                                     bit-identical CPU-reference determinism.
-│   ├── test_numeric_validation.py      — Accuracy, equality, bit-identity, and finiteness
-│   │                                     contract coverage.
-│   └── test_ops.py                     — Torch operation identities with complete
-│                                         accuracy checks.
 ├── operations/
 │   ├── test_chunk.py                   — chunk recurrence accuracy, grouped invariance, and
 │   │                                     bit-identical implementation determinism.
@@ -74,6 +67,15 @@ tests/
                                           SP1xTP8, SP2xTP4, and SP4xTP2.
 ```
 
+CPU-reference tests live beside the implementation:
+
+```text
+models/demos/deepseek_v3_d_p/reference/kda/tests/
+├── test_config.py                       — Config mapping and validation contracts.
+├── test_layer.py                        — Transition accuracy and optional bounded determinism.
+└── test_ops.py                          — Torch operation identities and accuracy checks.
+```
+
 ## Commands
 
 Hermetic and real-weight correctness, excluding perf:
@@ -82,6 +84,7 @@ Hermetic and real-weight correctness, excluding perf:
 KIMI_K3_CKPT=/path/to/pinned/kimi-k3 \
 scripts/run_safe_pytest.sh --run-all \
   models/demos/deepseek_v3_d_p/tests/kda \
+  models/demos/deepseek_v3_d_p/reference/kda/tests \
   --ignore=models/demos/deepseek_v3_d_p/tests/kda/perf -q -s
 ```
 
@@ -104,8 +107,8 @@ scripts/run_safe_pytest.sh --run-all \
 Optional bounded CPU-reference determinism:
 
 ```bash
-KDA_RUN_LONG_TESTS=1 pytest -q -s \
-  models/demos/deepseek_v3_d_p/tests/kda/reference/test_layer.py \
+KDA_RUN_LONG_TESTS=1 scripts/run_safe_pytest.sh \
+  models/demos/deepseek_v3_d_p/reference/kda/tests/test_layer.py \
   -k reference_layer_determinism
 ```
 
