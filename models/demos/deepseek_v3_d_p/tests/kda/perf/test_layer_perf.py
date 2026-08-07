@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 import torch
+from loguru import logger
 
 import ttnn
 from models.common.utility_functions import run_for_blackhole
@@ -136,8 +137,8 @@ def _load_or_compute_cpu_reference(case: KimiK3TestCase) -> tuple[torch.Tensor, 
         payload = torch.load(cache_path, map_location="cpu", weights_only=True)
         output, state = _validate_cached_reference(case, payload)
         elapsed = time.perf_counter() - start
-        print(f"KDA_T5120_CPU_REFERENCE_CACHE=hit path={cache_path}", flush=True)
-        print(f"KDA_T5120_CPU_REFERENCE_SECONDS={elapsed:.3f}", flush=True)
+        logger.info(f"KDA T=5120 CPU reference cache hit: {cache_path}")
+        logger.info(f"KDA T=5120 CPU reference load completed in {elapsed:.3f} seconds")
         return output, state, elapsed
 
     output, state = kda_forward_reference(case.hidden, case.state_dict, case.config)
@@ -151,8 +152,8 @@ def _load_or_compute_cpu_reference(case: KimiK3TestCase) -> tuple[torch.Tensor, 
     finally:
         temporary_path.unlink(missing_ok=True)
     elapsed = time.perf_counter() - start
-    print(f"KDA_T5120_CPU_REFERENCE_CACHE=miss path={cache_path}", flush=True)
-    print(f"KDA_T5120_CPU_REFERENCE_SECONDS={elapsed:.3f}", flush=True)
+    logger.info(f"KDA T=5120 CPU reference cache miss: {cache_path}")
+    logger.info(f"KDA T=5120 CPU reference computation completed in {elapsed:.3f} seconds")
     return output, state, elapsed
 
 
