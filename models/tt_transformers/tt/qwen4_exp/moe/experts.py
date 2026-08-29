@@ -109,7 +109,8 @@ def experts_decode_forward(
         ),
         dtype=activation_dtype,
     )
-    hidden_states.deallocate(True)
+    # NOTE: do NOT deallocate hidden_states here — it is the CALLER's tensor
+    # (moe.py reuses it for the shared expert right after the routed path).
     up = ttnn.reshape(up, (batch_size, config.num_experts, 1, weights.intermediate_size_per_device))
     up = ttnn.transpose(up, 1, 2)
     up = ttnn.reshape(up, (batch_size, config.num_experts, weights.intermediate_size_per_device))
