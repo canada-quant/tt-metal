@@ -35,7 +35,13 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 # --- stdlib-only module constants (host-importable) ---
-CKPT_PREFIX = "model."
+# On-disk safetensors prefix, verified verbatim against the checkpoint weight_map
+# (snapshot de4b8e4d, 1658 keys): the text tower lives under "model.language_model."
+# (1293 keys); "model.visual." (333) and "mtp." towers are skipped in v1; "lm_head.weight"
+# is TOP-LEVEL (no prefix). NOTE: the transformers meta-device probe (module_map.txt)
+# reports the text model's INTERNAL naming "model.*" — that is NOT the on-disk key prefix.
+CKPT_PREFIX = "model.language_model."
+LM_HEAD_KEY = "lm_head.weight"  # top-level, NOT under CKPT_PREFIX
 HIDDEN = 2560  # config hidden_size
 HC_COUNT = 4  # config hc_count
 HCW = HIDDEN * HC_COUNT  # 10240 hyper-stream width
@@ -223,8 +229,12 @@ class Qwen4ExpModel:
 
         # Host-side weight refs (never staged whole to device in phase-1).
         self._embed_weight = state_dict[CKPT_PREFIX + "embed_tokens.weight"]  # (vocab, 2560)
-        self._final_norm_weight = state_dict.get(CKPT_PREFIX + "norm.weight")  # (2560,) or None
-        self._lm_head_weight = state_dict.get("lm_head.weight")  # (vocab, 2560) or tied
+        # On-disk truth (weight_map, snapshot de4b8e4d): there is NO
+        # "model.language_model.norm.weight" — the text model ships no learnable final-norm
+        # weight. The global mixer's zero-centered hc_norm already normalizes the stream;
+        # last_hidden is therefore the mixer output directly (see final_norm).
+        self._final_norm_weight = state_dict.get(CKPT_PREFIX + "norm.weight")  # None on-disk
+        self._lm_head_weight = state_dict.get(LM_HEAD_KEY)  # top-level "lm_head.weight"
 
     # ----- host-side front / back stages (torch, host-offload philosophy) -----
 
@@ -246,19 +256,24 @@ class Qwen4ExpModel:
         return ttnn.to_torch(stream_device)
 
     def final_norm(self, last_hidden):
-        """Host RMSNorm over the last 2560 dim.
+        """The final pre-logits normalization.
 
-        Follows the model's pervasive zero-centered (1+w) RMSNorm pattern (verified for
-        the HC + PLE norms); the exact final-norm form is gated in the wiring leg against
-        p2d/mixer.pt + logits_top10.pt before any device claim.
+        On-disk truth (weight_map, snapshot de4b8e4d): there is NO
+        ``model.language_model.norm.weight`` — the text model ships no learnable
+        final-norm weight. The global mixer's zero-centered hc_norm already
+        normalizes the stream (contracts §2.7), so the mixer output IS the final
+        hidden state and this is the IDENTITY. A zero-centered RMSNorm branch is
+        kept only defensively (should a future checkpoint add the weight); it is
+        gated in the wiring leg against p2d/mixer.pt + logits_top10.pt.
         """
+        if self._final_norm_weight is None:
+            return last_hidden  # identity — mixer hc_norm is the final normalization
         import torch  # noqa: PLC0415
 
         x = last_hidden.float()
         ms = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(ms + RMS_NORM_EPS)
-        if self._final_norm_weight is not None:
-            x = x * (1.0 + self._final_norm_weight.float())
+        x = x * (1.0 + self._final_norm_weight.float())
         return x.to(last_hidden.dtype)
 
     def logits(self, last_hidden):
