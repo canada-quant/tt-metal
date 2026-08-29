@@ -95,6 +95,7 @@ def recurrent_forward(gdn, x, mode="recurrent", chunk_size=None, valid_len=None)
         use_inplace_state=gdn.use_inplace_state,
         chunk_seq_masks=seq_masks,
         valid_len=valid_len,
+        gate_activation="sigmoid",  # qwen4_exp config.json output_gate_type == "sigmoid" (HF-verified)
     )
 
     if gdn._chunk_inplace_state and mode == "chunk":

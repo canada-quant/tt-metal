@@ -25,11 +25,18 @@ def _seq_memory_config(seq_len):
     return ttnn.L1_MEMORY_CONFIG if seq_len <= _L1_SEQ_THRESHOLD else None
 
 
-def rms_norm_gated_ttnn(x, gate, weight, eps=1e-5, memory_config=None):
-    """RMSNorm + SiLU gate (trace-compatible). Clips gate to avoid overflow at long T."""
+def rms_norm_gated_ttnn(x, gate, weight, eps=1e-5, memory_config=None, gate_activation="silu"):
+    """RMSNorm + output gate (trace-compatible). Clips gate to avoid overflow at long T.
+
+    gate_activation: "silu" (qwen36 default) or "sigmoid" (qwen4_exp / Qwen3.8-Flash-Next —
+    config.json output_gate_type == "sigmoid"; HF applies sigmoid in Qwen4ExpTextRMSNormGated).
+    """
     mc = memory_config
     x_normed = ttnn.rms_norm(x, weight=weight, epsilon=eps, memory_config=mc)
-    gate_act = ttnn.silu(gate, memory_config=mc)
+    if gate_activation == "sigmoid":
+        gate_act = ttnn.sigmoid(gate, memory_config=mc)
+    else:
+        gate_act = ttnn.silu(gate, memory_config=mc)
     gate_act = ttnn.clip(gate_act, min=-1e4, max=1e4)
     return ttnn.multiply(x_normed, gate_act, memory_config=mc)
 
@@ -397,6 +404,7 @@ def gated_deltanet_forward_ttnn(
     use_inplace_state=False,  # ttnn.copy for trace-stable state
     chunk_seq_masks=None,  # cached masks for gated_delta_attn_seq prefill
     valid_len=None,  # fixed-bucket padding; zeros padded positions in scan
+    gate_activation="silu",  # "silu" (qwen36) | "sigmoid" (qwen4_exp output_gate_type)
 ):
     """Gated DeltaNet forward. mode: recurrent (decode T=1) or chunk (prefill T>1).
 
@@ -750,7 +758,7 @@ def gated_deltanet_forward_ttnn(
         else:
             gate = ttnn.linear(hidden_states, g_proj_weight, memory_config=mc, compute_kernel_config=ckc)
             gate = ttnn.reshape(gate, [B, T, num_v_heads, head_v_dim], memory_config=mc)
-        o = rms_norm_gated_ttnn(o, gate, o_norm_weight, eps=norm_eps, memory_config=mc)
+        o = rms_norm_gated_ttnn(o, gate, o_norm_weight, eps=norm_eps, memory_config=mc, gate_activation=gate_activation)
     else:
         o = rms_norm_ttnn(o, o_norm_weight, eps=norm_eps, memory_config=mc)
 
