@@ -55,6 +55,16 @@ def _ttnn():
     return ttnn
 
 
+def _replicated_mesh_to_host(ttnn, mesh_device, t):
+    """0.19.0-era fix: plain ttnn.to_torch on a replicate-mapped mesh tensor is TT_FATAL
+    (pytensor.cpp buffers.size()==1 — a mesh composer is required). Concat along dim 0
+    stacks the 4 identical replicas; take the first."""
+    if mesh_device is None:
+        return ttnn.to_torch(t)
+    cat = ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0))
+    return cat[: t.shape[0]]
+
+
 def _strip_prefix(state_dict: dict, prefix: str) -> dict:
     """Return the sub-dict with ``prefix`` removed from each key."""
     n = len(prefix)
@@ -253,7 +263,7 @@ class Qwen4ExpModel:
     def stream_to_host(self, stream_device):
         """Bring the device stream back to host torch (…,10240)."""
         ttnn = _ttnn()
-        return ttnn.to_torch(stream_device)
+        return _replicated_mesh_to_host(ttnn, self.device, stream_device)
 
     def final_norm(self, last_hidden):
         """The final pre-logits normalization.
@@ -345,7 +355,7 @@ class Qwen4ExpModel:
             )
 
         last_hidden_device = self.mixer.forward(stream)  # (B,S,2560) use_combine=False
-        return ttnn.to_torch(last_hidden_device)
+        return _replicated_mesh_to_host(ttnn, self.device, last_hidden_device)
 
     @staticmethod
     def _torch_bf16():

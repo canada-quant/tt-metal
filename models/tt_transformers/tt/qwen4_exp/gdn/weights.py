@@ -243,8 +243,11 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
 
     def _precompute_fused_ab_weight():
         """Pre-concatenate a_proj + b_proj weights into [4096, 64] for fused matmul."""
-        a_w = ttnn.to_torch(a_proj_weight)  # [4096, 32]
-        b_w = ttnn.to_torch(b_proj_weight)  # [4096, 32]
+        # 0.19.0-era fix: fuse from the HOST state_dict (post-remap) — plain ttnn.to_torch on a
+        # replicate-mapped mesh tensor is TT_FATAL (pytensor.cpp buffers.size()==1), and a device
+        # round-trip would double-quantize through bfloat8_b. Same values as load_weight_2d's input.
+        a_w = state_dict["in_proj_a.weight"].T.contiguous()  # [4096, 32]
+        b_w = state_dict["in_proj_b.weight"].T.contiguous()  # [4096, 32]
         fused = torch.cat([a_w, b_w], dim=1).contiguous()  # [4096, 64]
         return ttnn.from_torch(fused, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh_device)
 
@@ -256,10 +259,11 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
         """
         if qkv_proj_weight is None:
             return None
-        qkv_w = ttnn.to_torch(qkv_proj_weight)  # [4096, 8192]
-        a_w = ttnn.to_torch(a_proj_weight)  # [4096, 32]
-        b_w = ttnn.to_torch(b_proj_weight)  # [4096, 32]
-        g_w = ttnn.to_torch(g_proj_weight)  # [4096, 4096]
+        # 0.19.0-era fix: host-side fusion (see _precompute_fused_ab_weight note).
+        qkv_w = state_dict["qkv_proj.weight"].T.contiguous()  # [4096, 8192]
+        a_w = state_dict["in_proj_a.weight"].T.contiguous()  # [4096, 32]
+        b_w = state_dict["in_proj_b.weight"].T.contiguous()  # [4096, 32]
+        g_w = state_dict["in_proj_z.weight"].T.contiguous()  # [4096, 4096]
         fused = torch.cat([qkv_w, a_w, b_w, g_w], dim=1).contiguous()
         return ttnn.from_torch(fused, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh_device)
 
