@@ -172,6 +172,7 @@ class Qwen4ExpDecoderLayer:
         gdn_mode: str = "recurrent",
         gdn_chunk_size: Optional[int] = None,
         gdn_valid_len: Optional[int] = None,
+        layer_debug=None,
     ):
         """Advance the 10240 hyper stream through this decoder layer (contracts §2.10).
 
@@ -192,6 +193,31 @@ class Qwen4ExpDecoderLayer:
             stream = ttnn.add(stream, self.ple.forward(ple_emb, stream))
 
         # 2. attn gated residual: mix_input -> (GDN|QSA)(mixed) -> apply_residual.
+        if layer_debug is not None and layer_debug.get("layer") == self.layer_idx:
+            # Instrumented sub-step path (model-leg divergence localization): run the
+            # HC gated residuals EXPLICITLY and capture host copies of every
+            # intermediate for the driver to PCC against p2d/hc0/hc0.pt refs.
+            host = lambda t: _replicated_mesh_to_host(ttnn, self.device, t)  # noqa: E731
+            mixed, inj = self.attn_hc.mix_input(stream)
+            layer_debug["attn_mixed"] = host(mixed)
+            layer_debug["attn_injection"] = host(inj)
+            if self.is_qsa:
+                block_out = self.block(mixed, cos, sin)
+            else:
+                block_out = self.block(
+                    mixed, mode=gdn_mode, chunk_size=gdn_chunk_size, valid_len=gdn_valid_len
+                )
+            layer_debug["attn_block_out"] = host(block_out)
+            stream = self.attn_hc.apply_residual(stream, block_out, inj)
+            layer_debug["post_attn_stream"] = host(stream)
+            mixed2, inj2 = self.mlp_hc.mix_input(stream)
+            layer_debug["mlp_mixed"] = host(mixed2)
+            layer_debug["mlp_injection"] = host(inj2)
+            moe_out = self.moe(mixed2)
+            layer_debug["moe_out"] = host(moe_out)
+            stream = self.mlp_hc.apply_residual(stream, moe_out, inj2)
+            layer_debug["post_mlp_stream"] = host(stream)
+            return stream
         if self.is_qsa:
             stream = self.attn_hc.forward(stream, lambda mixed: self.block(mixed, cos, sin))
         else:
@@ -307,6 +333,7 @@ class Qwen4ExpModel:
         gdn_valid_len: Optional[int] = None,
         mesh_mapper=None,
         stream_trace=None,
+        layer_debug=None,
     ):
         """Run the full 48-layer composition.
 
@@ -355,6 +382,7 @@ class Qwen4ExpModel:
                 gdn_mode=gdn_mode,
                 gdn_chunk_size=gdn_chunk_size,
                 gdn_valid_len=gdn_valid_len,
+                layer_debug=layer_debug,
             )
             if stream_trace is not None:
                 stream_trace.append(_replicated_mesh_to_host(ttnn, self.device, stream))
