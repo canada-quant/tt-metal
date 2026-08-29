@@ -52,7 +52,16 @@ class Qwen4ExpMoE:
         self.tp = tp
         self.ccl_manager = ccl_manager
         self.mesh_config = mesh_config
-        self.program_config = program_config if program_config is not None else ProgramConfig()
+        # Core grids MUST tile num_blocks_total rectangularly (sparse_matmul mcast1d
+        # factory: num_cores_with_work == receiver bounding box). gpt_oss defaults
+        # (3,4)/(5,6) fail for qwen4_exp dims: gate/up Nt=20 -> pcn=2 -> 10 blocks
+        # (10%3!=0 TT_FATAL), down Nt=80 -> pcn=3 -> 27 (27%5!=0). (5,4) gives
+        # gate/up pcn=1 -> 20 blocks (20%5==0) and down pcn=4 -> 20 (20%5==0).
+        self.program_config = (
+            program_config
+            if program_config is not None
+            else ProgramConfig(decode_gate_up_cores=(5, 4), decode_down_cores=(5, 4))
+        )
         sd = remap_flash_next_moe_state_dict(state_dict) if state_dict else None
         self.router = Qwen4ExpRouter(mesh_device, config, sd, tensor_cache_path=tensor_cache_path)
         self.expert_weights = load_expert_weights(
