@@ -206,7 +206,7 @@ class PleWeights:
     norm_key_plus1: Any  # (1, 1, HC_COUNT, HIDDEN) bf16 — (1 + norm_key.weight) precomputed
     norm_query_plus1: Any  # (1, 1, HC_COUNT, HIDDEN) bf16
     norm_conv_plus1: Any  # (1, 1, HC_COUNT, HIDDEN) bf16
-    conv_taps: List[Any]  # 4 x (1, 1, 1, HCW) bf16 — depthwise taps w[:, 0, k]
+    conv_taps: List[Any]  # 4 x (1, 1, 1, HCW) bf16 — depthwise taps, LAG-ORDERED (tap k = w[:, 0, 3-k], F.conv1d cross-correlation)
 
 
 class PleLayer:
@@ -253,7 +253,14 @@ class PleLayer:
             return (1.0 + w).to(torch.bfloat16).reshape(1, 1, HC_COUNT, HIDDEN)
 
         conv_w = sd("conv1d.weight").to(torch.bfloat16)  # (10240,1,4)
-        taps = [conv_w[:, 0, k].contiguous().reshape(1, 1, 1, HCW) for k in range(CONV_KERNEL)]
+        # F.conv1d is CROSS-CORRELATION: out[s] = sum_k w[k] * x_pad[s + 3k]
+        # = sum_j w[3-j] * x[s - 3j]. The composed loop in _depthwise_dilated_conv
+        # pairs x[s-3k] with conv_taps[k], so taps must be loaded REVERSED
+        # (conv_taps[k] = w[:, 0, 3-k] — LAG-ORDERED). Loading them in raw weight
+        # order was the P4 ple-leg FAIL root cause (PCC 0.45981, per-pos
+        # [0.9164, 0.4448, ...]: position 0 has a single active tap so the error is
+        # a fraction of the residual; positions >=1 accumulate 2-4 reversed taps).
+        taps = [conv_w[:, 0, CONV_KERNEL - 1 - k].contiguous().reshape(1, 1, 1, HCW) for k in range(CONV_KERNEL)]
 
         return PleWeights(
             key_proj=self._to_device(ttnn, key_w),
