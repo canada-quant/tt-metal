@@ -199,3 +199,7 @@ class HyperConnectionMixer(HyperConnection):
     def forward(self, x_stream):
         mixed, _ = self.mix_input(x_stream)
         return mixed
+
+    def __call__(self, x_stream):
+        """nn.Module-style alias: `mixer(x)` == `mixer.forward(x)` (pcc_device_hc.py convention)."""
+        return self.forward(x_stream)
