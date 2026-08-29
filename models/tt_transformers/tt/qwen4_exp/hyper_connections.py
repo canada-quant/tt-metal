@@ -120,7 +120,7 @@ class HyperConnection:
 
         x: (…, 10240) -> returns (…, 10240). Mirrors pcc_hc.py `grouped_rms_norm`.
         """
-        lead = x.shape[:-1]
+        lead = list(x.shape)[:-1]
         x4 = ttnn.reshape(x, (*lead, HC_COUNT, HIDDEN))
         # ttnn.rms_norm normalizes the last dim per row: groups fall out of the reshape.
         n4 = ttnn.rms_norm(
@@ -146,7 +146,7 @@ class HyperConnection:
         mix_w = ttnn.linear(mix_w, w.up, compute_kernel_config=self.compute_kernel_config)
         mix_w = ttnn.sigmoid(mix_w)
 
-        lead = x_stream.shape[:-1]
+        lead = list(x_stream.shape)[:-1]
         mix4 = ttnn.reshape(mix_w, (*lead, HC_COUNT, HIDDEN))
         mixed = ttnn.multiply(mix4, normed4)
         mixed = ttnn.mean(mixed, dim=-2)  # (…,2560)
@@ -167,7 +167,7 @@ class HyperConnection:
         ttnn = _ttnn()
         if not self.has_inject or injection is None:
             raise ValueError("apply_residual requires a block HC (has_inject=True) and its injection tensor")
-        lead = x_stream.shape[:-1]
+        lead = list(x_stream.shape)[:-1]
         b4 = ttnn.unsqueeze(block_out, -2)  # (…,1,2560)
         i4 = ttnn.unsqueeze(injection, -1)  # (…,4,1)
         scaled = ttnn.multiply(b4, i4)  # broadcast (…,4,2560)

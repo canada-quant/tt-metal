@@ -269,7 +269,7 @@ class PleLayer:
 
         x: (…, 10240) -> (…, 10240). Mirrors pcc_ple1.py `rmsnorm_grouped`.
         """
-        lead = x.shape[:-1]
+        lead = list(x.shape)[:-1]
         x4 = ttnn.reshape(x, (*lead, HC_COUNT, HIDDEN))
         n4 = ttnn.rms_norm(x4, epsilon=EPS, compute_kernel_config=self.compute_kernel_config)
         n4 = ttnn.multiply(n4, weight_plus1)  # zero-centered scale, broadcast (1,1,4,2560)
@@ -321,7 +321,7 @@ class PleLayer:
         value4 = ttnn.unsqueeze(value, -2)  # (1,1,S,1,2560)
         gated = ttnn.multiply(ttnn.sigmoid(gate_ss), value4)  # broadcast (1,1,S,4,2560)
 
-        lead = emb.shape[:-1]
+        lead = list(emb.shape)[:-1]
         gated_flat = ttnn.reshape(gated, (*lead, HCW))  # (1,1,S,10240)
         gated_normed, _ = self._grouped_rms_norm(ttnn, gated_flat, w.norm_conv_plus1)
 
