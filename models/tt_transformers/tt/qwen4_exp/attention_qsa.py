@@ -61,6 +61,9 @@ EXPECTED_BARE_KEYS = (
 )
 
 
+RMS_NORM_EPS = 1e-6
+
+
 def build_attention_config(args) -> AttentionConfig:
     """Map Qwen4ExpTextArgs -> qwen36 ``AttentionConfig`` (config-driven delta only).
 
@@ -71,7 +74,10 @@ def build_attention_config(args) -> AttentionConfig:
         num_heads=args.num_attention_heads,        # 24
         num_kv_heads=args.num_key_value_heads,     # 2
         head_dim=args.head_dim,                    # 256
-        norm_eps=args.rms_norm_eps,                # 1e-6
+        norm_eps=RMS_NORM_EPS,                       # 1e-6 — config.json value (verified in
+                                                     # capture_hc.py); the args dataclass omits
+                                                     # rms_norm_eps by design (see model.py), so
+                                                     # supply the constant like hc/ple modules do.
         max_seq_len=args.max_position_embeddings,  # 262144
     )
 
