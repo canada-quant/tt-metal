@@ -306,6 +306,7 @@ class Qwen4ExpModel:
         gdn_chunk_size: Optional[int] = None,
         gdn_valid_len: Optional[int] = None,
         mesh_mapper=None,
+        stream_trace=None,
     ):
         """Run the full 48-layer composition.
 
@@ -343,6 +344,8 @@ class Qwen4ExpModel:
         if rope is not None:
             cos, sin = rope
 
+        if stream_trace is not None:
+            stream_trace.append(_replicated_mesh_to_host(ttnn, self.device, stream))
         for layer in self.layers:
             stream = layer.forward(
                 stream,
@@ -353,6 +356,8 @@ class Qwen4ExpModel:
                 gdn_chunk_size=gdn_chunk_size,
                 gdn_valid_len=gdn_valid_len,
             )
+            if stream_trace is not None:
+                stream_trace.append(_replicated_mesh_to_host(ttnn, self.device, stream))
 
         last_hidden_device = self.mixer.forward(stream)  # (B,S,2560) use_combine=False
         return _replicated_mesh_to_host(ttnn, self.device, last_hidden_device)

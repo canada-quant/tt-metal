@@ -87,15 +87,24 @@ class Qwen4ExpMoE:
         """
         seq = hidden_states.shape[2]
         if seq > 1:
+            # Whole-tile token slicing: slicing dim 2 of a (1,B,seq,H) TILE tensor
+            # at [t:t+1] cuts INSIDE a tile row (seq is one 32-tile tall) — an
+            # unaligned ttnn.slice that is not data-safe on 0.19.0-era tiles
+            # (model-leg FAIL #3 suspect). Reshaping to (1, B*seq, 1, H) first is
+            # view-only (identical 32x2560 tile footprint, same row order) and
+            # moves tokens to dim 1, where every [t:t+1] slice selects WHOLE
+            # tiles — provably data-safe. Decode path per token is unchanged.
+            xr = ttnn.reshape(hidden_states, (1, hidden_states.shape[1] * seq, 1, hidden_states.shape[3]))
             outs = []
             for t in range(seq):
-                x_t = hidden_states[:, :, t : t + 1, :]
+                x_t = xr[:, t : t + 1, :, :]  # (1,B,1,H) — whole-tile slice
                 outs.append(self(x_t))
                 ttnn.deallocate(x_t)
-            out = ttnn.concat(outs, dim=2)
+            out = ttnn.concat(outs, dim=1)  # (1, B*seq, 1, H)
             for o in outs:
                 ttnn.deallocate(o)
-            return out
+            ttnn.deallocate(xr)
+            return ttnn.reshape(out, hidden_states.shape)
         indices, rw512 = self.router(hidden_states)
         ttnn.deallocate(indices)  # sparse_matmul consumes only the scattered 512-wide vector
         routed = experts_decode_forward(
