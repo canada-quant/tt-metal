@@ -67,6 +67,10 @@ class Qwen4ExpGatedDeltaNet:
         # Eager prefill keeps the reassign path. See Qwen36Model.capture_prefill_trace_chunked.
         self._chunk_inplace_state = False
 
+    def __call__(self, x, mode="recurrent", chunk_size=None, valid_len=None):
+        """nn.Module-style callable — model.py wires HC block_fns as callables (moe/mixer precedent)."""
+        return self.forward(x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
+
     def forward(self, x, mode="recurrent", chunk_size=None, valid_len=None):
         return recurrent_forward(self, x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
 

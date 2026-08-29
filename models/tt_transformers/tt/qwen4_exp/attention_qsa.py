@@ -147,6 +147,10 @@ class Qwen4ExpQSAAttention:
         """Duplicate-half cos/sin [1, seq_len, rotary_dim] for this layer's theta."""
         return duplicate_half_rope(seq_len, self.rotary_dim, self.args.rope_theta, dtype=dtype)
 
+    def __call__(self, x, cos, sin, **kwargs):
+        """nn.Module-style callable — model.py wires HC block_fns as callables (moe/mixer precedent)."""
+        return self.forward(x, cos, sin, **kwargs)
+
     def forward(self, x, cos, sin, **kwargs):
         return self.inner.forward(x, cos, sin, **kwargs)
 
