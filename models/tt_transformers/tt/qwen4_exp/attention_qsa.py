@@ -152,7 +152,17 @@ class Qwen4ExpQSAAttention:
         return self.forward(x, cos, sin, **kwargs)
 
     def forward(self, x, cos, sin, **kwargs):
-        return self.inner.forward(x, cos, sin, **kwargs)
+        # Same 4D->3D contract shim as the GDN block (model-leg crash #2):
+        # model.py feeds the HC-mixed stream as (1,B,T,H); the qwen36 inner
+        # attention was leg-proven on 3D (B,T,H) (pcc_device_qsa.py). 3D inputs
+        # pass through untouched.
+        squeeze = len(x.shape) == 4 and x.shape[0] == 1
+        if squeeze:
+            x = ttnn.reshape(x, (x.shape[1], x.shape[2], x.shape[3]))
+        out = self.inner.forward(x, cos, sin, **kwargs)
+        if squeeze:
+            out = ttnn.reshape(out, (1, out.shape[0], out.shape[1], out.shape[2]))
+        return out
 
     def reset_cache(self):
         self.inner.reset_cache()

@@ -72,14 +72,30 @@ class Qwen4ExpMoE:
         )
 
     def __call__(self, hidden_states):
-        """Decode forward: x -> routed experts + gated shared expert.
+        """x -> routed experts + gated shared expert.
 
         Args:
-            hidden_states: ttnn [1, batch, 1, hidden_size] (seq_len=1 decode).
+            hidden_states: ttnn [1, batch, seq, hidden_size]. seq == 1 is the
+                decode path (proven in the moe leg); seq > 1 loops the same
+                decode path per token and concats on dim 2 — the exact prefill
+                pattern pcc_device_moe.py used (per-token [1,B,1,H] calls) —
+                because the router/sparse_matmul/scatter path is seq=1-shaped.
+                The model leg feeds the HC-mixed stream as [1,1,Sp,2560].
 
         Returns:
-            ttnn [1, batch, 1, hidden_size] mlp block output.
+            ttnn [1, batch, seq, hidden_size] mlp block output.
         """
+        seq = hidden_states.shape[2]
+        if seq > 1:
+            outs = []
+            for t in range(seq):
+                x_t = hidden_states[:, :, t : t + 1, :]
+                outs.append(self(x_t))
+                ttnn.deallocate(x_t)
+            out = ttnn.concat(outs, dim=2)
+            for o in outs:
+                ttnn.deallocate(o)
+            return out
         indices, rw512 = self.router(hidden_states)
         ttnn.deallocate(indices)  # sparse_matmul consumes only the scattered 512-wide vector
         routed = experts_decode_forward(

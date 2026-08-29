@@ -72,7 +72,19 @@ class Qwen4ExpGatedDeltaNet:
         return self.forward(x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
 
     def forward(self, x, mode="recurrent", chunk_size=None, valid_len=None):
-        return recurrent_forward(self, x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
+        # Shape shim (model-leg crash #2, 19:08Z TT_FATAL slice_end > padded_shape):
+        # qwen4_exp model.py feeds the HC-mixed stream in the tt_transformers 4D
+        # convention (1,B,T,H); the qwen36-derived kernel is strictly 3D (B,T,H) —
+        # T = x.shape[1] and the q/k/v split slices dim 2, so a 4D input makes
+        # dim 2 the TOKEN axis. Drop a leading unit dim here and restore it on
+        # the way out; 3D inputs (the gdn leg contract) pass through untouched.
+        squeeze = len(x.shape) == 4 and x.shape[0] == 1
+        if squeeze:
+            x = ttnn.reshape(x, (x.shape[1], x.shape[2], x.shape[3]))
+        out = recurrent_forward(self, x, mode=mode, chunk_size=chunk_size, valid_len=valid_len)
+        if squeeze:
+            out = ttnn.reshape(out, (1, out.shape[0], out.shape[1], out.shape[2]))
+        return out
 
     def set_external_state(self, recurrent_state, conv_state):
         """Point layer at externally-allocated state buffers.
