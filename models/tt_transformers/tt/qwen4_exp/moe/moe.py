@@ -94,6 +94,23 @@ class Qwen4ExpMoE:
             tp=self.tp,
         )
         shared = shared_expert_forward(hidden_states, self.shared_weights, self.config)
+        # shared down_proj is row-sharded (dim 2: K=640 -> 160/device) so
+        # shared_expert_forward returns PARTIAL sums per device. The routed path
+        # all-reduces inside experts_decode_forward; the shared partials must be
+        # reduced here before the add (separate collective — a fused
+        # single-all-reduce for routed+shared is a comms follow-up).
+        if self.tp > 1:
+            from models.demos.gpt_oss.tt.experts.operations import (
+                apply_tensor_parallel_allreduce,
+            )
+
+            shared = apply_tensor_parallel_allreduce(
+                shared,
+                self.mesh_config,
+                hidden_states.device(),
+                hidden_states.shape[2],
+                self.ccl_manager,
+            )
         out = ttnn.add(routed, shared)
         ttnn.deallocate(routed)
         ttnn.deallocate(shared)
