@@ -501,6 +501,8 @@ def chunk_gated_delta_rule_seq(
     del q, v, k_beta, v_beta
 
     _eye_32 = None
+    if cached_masks is not None and int(cached_masks["triu_ones"].shape[-1]) != chunk_size:
+        cached_masks = create_chunk_masks_seq(chunk_size, mesh_device)  # stale-mask guard: caller overrode chunk_size (e.g. QWEN4EXP_GDN_CHUNK=64) — rebuild masks for this chunk
     if cached_masks is not None:
         triu_ones = cached_masks["triu_ones"]
         tril_mask = cached_masks["tril_mask"]
