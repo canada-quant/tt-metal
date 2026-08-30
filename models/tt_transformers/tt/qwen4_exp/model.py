@@ -237,7 +237,7 @@ class Qwen4ExpDecoderLayer:
             mixed2, inj2 = self.mlp_hc.mix_input(stream)
             layer_debug["mlp_mixed"] = host(mixed2)
             layer_debug["mlp_injection"] = host(inj2)
-            moe_out = self.moe(mixed2)
+            moe_out = self.moe(mixed2, layer_debug=layer_debug)
             layer_debug["moe_out"] = host(moe_out)
             stream = self.mlp_hc.apply_residual(stream, moe_out, inj2)
             layer_debug["post_mlp_stream"] = host(stream)
