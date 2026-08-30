@@ -8,6 +8,7 @@
 
 #include "ttnn/operations/transformer/gated_delta_attn/device/gated_delta_attn_program_factory.hpp"
 
+#include <cstdlib>
 #include <optional>
 #include <set>
 #include <vector>
@@ -167,7 +168,13 @@ GatedDeltaAttnSeqProgramFactory::cached_program_t GatedDeltaAttnSeqProgramFactor
         kdir + "compute/gated_delta_attn.cpp",
         cores,
         ComputeConfig{
-            .math_fidelity = MathFidelity::HiFi2,
+            // QWEN_GDN_OP_HIFI4=1 raises the scan kernel's matmul fidelity HiFi2 -> HiFi4
+            // (GDN fidelity-matrix lever L3; default preserves the shipped HiFi2 posture).
+            // Read fresh per call, same pattern as QWEN_GDN_PHASED in the chunk op front-end.
+            .math_fidelity = [] {
+                const char* e = std::getenv("QWEN_GDN_OP_HIFI4");
+                return (e != nullptr && e[0] == '1') ? MathFidelity::HiFi4 : MathFidelity::HiFi2;
+            }(),
             .fp32_dest_acc_en = true,
             .math_approx_mode = false,
             .compile_args = ct_args});
