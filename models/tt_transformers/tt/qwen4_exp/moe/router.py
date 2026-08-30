@@ -22,6 +22,21 @@ Transposed to (2560, 512) for ttnn.linear; replicated across the mesh (2.6 MB/la
 import ttnn
 
 
+def _replicated_mesh_to_host(mesh_device, t):
+    """Host copy of a mesh-REPLICATED tensor (qwen4_exp model-leg phase-1 layout).
+
+    Plain ttnn.to_torch on a replicate-mapped mesh tensor is TT_FATAL (a mesh
+    composer is required): concat along dim 0 stacks the identical replicas —
+    take the first. Same capture style as the model.py layer_debug precedent
+    (models/tt_transformers/tt/qwen4_exp/model.py::_replicated_mesh_to_host);
+    ttnn is module-level here so it is not a parameter.
+    """
+    if mesh_device is None:
+        return ttnn.to_torch(t)
+    cat = ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0))
+    return cat[: t.shape[0]]
+
+
 class Qwen4ExpRouter:
     """Top-10-of-softmax router for the 512-expert MoE."""
 
@@ -37,6 +52,7 @@ class Qwen4ExpRouter:
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
+        self.mesh_device = mesh_device  # Window H: needed by the layer_debug host captures
         if "gate.bias" in (state_dict or {}):
             raise ValueError("flash-next MoE router has NO bias (spec §1) — refusing to load one")
         torch_weight = None
@@ -76,11 +92,16 @@ class Qwen4ExpRouter:
 
         return os.path.join(tensor_cache_path, f"{name}.tensorbin")
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, layer_debug=None):
         """Route tokens.
 
         Args:
             hidden_states: ttnn tensor [..., hidden_dim] (bf16, TILE).
+            layer_debug: optional flat capture dict (Window H §6.14; model-leg
+                divergence localization). When set, the bf16 router logits and the
+                top-10 expert indices are host-captured (list-appended per call —
+                the seq>1 MoE loop fires this router once per token). Default None
+                = zero behavior change on every production path.
 
         Returns:
             (expert_indices, routing_weights_512):
@@ -98,6 +119,10 @@ class Qwen4ExpRouter:
             self.weight,
             memory_config=mem_config,
         )
+        if layer_debug is not None:  # Window H: host-capture bf16 router logits
+            layer_debug.setdefault("moe_router_logits", []).append(
+                _replicated_mesh_to_host(self.mesh_device, router_logits)
+            )
 
         # Pre-allocate the 512-wide zeros vector for the scatter BEFORE freeing
         # router_logits (gpt_oss topk.py: ttnn.scatter(ttnn.zeros_like(g), ...)).
@@ -115,6 +140,10 @@ class Qwen4ExpRouter:
         # 2) top-10 of the probabilities (sorted so weights/indices align).
         top_w, top_i = ttnn.topk(probs, k=self.top_k, dim=-1, sorted=True)
         ttnn.deallocate(probs)
+        if layer_debug is not None:  # Window H: host-capture top-10 expert indices
+            layer_debug.setdefault("moe_router_indices", []).append(
+                _replicated_mesh_to_host(self.mesh_device, top_i)
+            )
 
         # 3) L1 renorm (norm_topk_prob=True): w_i / sum_j w_j over the 10 selected.
         denom = ttnn.sum(top_w, dim=-1, keepdim=True)
