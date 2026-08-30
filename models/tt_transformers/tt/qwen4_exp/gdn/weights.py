@@ -23,7 +23,7 @@ from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_seq i
 # projection + fused weights as bf16 instead of the shipped bfloat8_b (weights-dtype lever).
 # Default preserves the shipped posture; every other dtype/layout/memory_config verbatim.
 _GDN_WDTYPE = os.environ.get("QWEN_GDN_WDTYPE", "bfp8").strip().lower()
-_GDN_PROJ_DTYPE = ttnn.bfloat16 if _GDN_WDTYPE == "bf16" else _GDN_PROJ_DTYPE
+_GDN_PROJ_DTYPE = ttnn.bfloat16 if _GDN_WDTYPE == "bf16" else ttnn.bfloat8_b
 
 @dataclass
 class GDNWeights:
