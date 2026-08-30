@@ -223,7 +223,10 @@ class Qwen4ExpDecoderLayer:
             layer_debug["attn_mixed"] = host(mixed)
             layer_debug["attn_injection"] = host(inj)
             if self.is_qsa:
-                block_out = self.block(mixed, cos, sin)
+                # Window G (tt-rd gdn-fidelity plan §6.13): pass layer_debug through
+                # so the QSA chain captures its qsa_* substep tensors into the same
+                # flat dict the driver saves to hc{L}/layer_debug_device.pt.
+                block_out = self.block(mixed, cos, sin, layer_debug=layer_debug)
             else:
                 block_out = self.block(
                     mixed, mode=gdn_mode, chunk_size=gdn_chunk_size, valid_len=gdn_valid_len
