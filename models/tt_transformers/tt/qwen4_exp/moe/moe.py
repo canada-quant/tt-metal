@@ -71,7 +71,7 @@ class Qwen4ExpMoE:
             mesh_device, config, sd, tensor_cache_path=tensor_cache_path
         )
 
-    def __call__(self, hidden_states):
+    def __call__(self, hidden_states, layer_debug=None):
         """x -> routed experts + gated shared expert.
 
         Args:
@@ -81,6 +81,9 @@ class Qwen4ExpMoE:
                 pattern pcc_device_moe.py used (per-token [1,B,1,H] calls) —
                 because the router/sparse_matmul/scatter path is seq=1-shaped.
                 The model leg feeds the HC-mixed stream as [1,1,Sp,2560].
+            layer_debug: optional flat capture dict (Window H §6.14) forwarded
+                into the router (per-token host captures of logits + indices).
+                Default None = zero behavior change.
 
         Returns:
             ttnn [1, batch, seq, hidden_size] mlp block output.
@@ -98,14 +101,14 @@ class Qwen4ExpMoE:
             outs = []
             for t in range(seq):
                 x_t = xr[:, t : t + 1, :, :]  # (1,B,1,H) — whole-tile slice
-                outs.append(self(x_t))
+                outs.append(self(x_t, layer_debug=layer_debug))
                 ttnn.deallocate(x_t)
             out = ttnn.concat(outs, dim=1)  # (1, B*seq, 1, H)
             for o in outs:
                 ttnn.deallocate(o)
             ttnn.deallocate(xr)
             return ttnn.reshape(out, hidden_states.shape)
-        indices, rw512 = self.router(hidden_states)
+        indices, rw512 = self.router(hidden_states, layer_debug=layer_debug)
         ttnn.deallocate(indices)  # sparse_matmul consumes only the scattered 512-wide vector
         routed = experts_decode_forward(
             hidden_states,
