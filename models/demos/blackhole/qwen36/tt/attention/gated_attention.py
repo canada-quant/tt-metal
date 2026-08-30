@@ -52,6 +52,10 @@ class Qwen36GatedAttention:
         chunk_page_table=None,
         chunk_start_idx=None,
         chunk_start_idx_tensor=None,
+        # Window G QSA substep capture dict (tt-rd plan §6.13); plumbed to the two
+        # prefill branches only — decode.py is out of the Window G edit set (the
+        # decode path is not exercised by the model leg). None = no-op.
+        layer_debug=None,
     ):
         T = x.shape[1]
         mc = ttnn.L1_MEMORY_CONFIG if T == 1 else None
@@ -92,6 +96,7 @@ class Qwen36GatedAttention:
                 chunk_start_idx=chunk_start_idx,
                 chunk_start_idx_tensor=chunk_start_idx_tensor,
                 use_paged_attention=True,
+                layer_debug=layer_debug,
             )
         else:
             # Branch C — concat prefill
@@ -107,6 +112,7 @@ class Qwen36GatedAttention:
                 past_key=self.past_key,
                 past_value=self.past_value,
                 use_paged_attention=False,
+                layer_debug=layer_debug,
             )
             self.past_key = new_key
             self.past_value = new_value
