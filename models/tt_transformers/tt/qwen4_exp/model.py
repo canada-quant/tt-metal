@@ -101,7 +101,8 @@ class Qwen4ExpDecoderLayer:
     (the hyper-connections.py gated-residual composition, bit-exact vs pcc_hc.py).
     """
 
-    def __init__(self, mesh_device, args, state_dict: dict, layer_idx: int, tensor_cache_path=None):
+    def __init__(self, mesh_device, args, state_dict: dict, layer_idx: int, tensor_cache_path=None,
+                 ccl_manager=None, mesh_config=None, tp: int = 1):
         from models.tt_transformers.tt.qwen4_exp.hyper_connections import (  # noqa: PLC0415
             HyperConnection,
         )
@@ -152,9 +153,29 @@ class Qwen4ExpDecoderLayer:
             Qwen4ExpMoEConfig,
         )
 
-        moe_cfg = Qwen4ExpMoEConfig.from_args(args)
+        # spec §7 A/B lever (same env the standalone moe leg driver reads):
+        # QWEN4EXP_MOE_DOWN_BFP8=1 flips down_proj BFP4->BFP8; base is BFP4.
+        import os as _os  # noqa: PLC0415
+
+        moe_cfg = Qwen4ExpMoEConfig.from_args(
+            args,
+            down_dtype=_ttnn().bfloat8_b if _os.environ.get("QWEN4EXP_MOE_DOWN_BFP8") == "1" else _ttnn().bfloat4_b,
+        )
         moe_sd = _strip_prefix(state_dict, lp + "mlp.")
-        self.moe = Qwen4ExpMoE(mesh_device, moe_cfg, moe_sd, tensor_cache_path=tensor_cache_path)
+        # TP plumbing is REQUIRED, not optional: the MoE weight loaders shard
+        # gate/up (dim 3, col-parallel) and down (dim 2, row-parallel) across ALL
+        # mesh devices unconditionally (moe/weights.py:95-96), so the forward MUST
+        # all-reduce the per-device partial sums — tp=1 SKIPS the reduce
+        # (moe/experts.py:158-161, moe/moe.py:127) and returns ~1/4-magnitude
+        # per-device partials. ROOT CAUSE of the 2026-08-30T07:19Z model-leg
+        # layer-0 moe_out pcc 0.65961164 (per-pos attenuation 0.23-0.37); the
+        # standalone moe leg passed because pcc_device_moe.py wires tp=4 +
+        # CCLManager + MeshConfig + FABRIC_1D_RING.
+        self.moe = Qwen4ExpMoE(
+            mesh_device, moe_cfg, moe_sd,
+            tensor_cache_path=tensor_cache_path,
+            ccl_manager=ccl_manager, mesh_config=mesh_config, tp=tp,
+        )
 
         # --- PLE n-gram injection (layer 1 only) ---
         self.ple = None
@@ -257,9 +278,29 @@ class Qwen4ExpModel:
             tensor_cache_path=tensor_cache_path,
         )
 
+        # TP4 collective plumbing for the in-model MoE (root-cause fix — see the
+        # layer ctor note): one CCLManager + MeshConfig shared across all 48 MoE
+        # instances (gpt_oss model pattern), tp = mesh width.
+        ccl_manager = mesh_config = None
+        tp = 1
+        if mesh_device is not None:
+            from models.demos.gpt_oss.config import MeshConfig, ModeConfig  # noqa: PLC0415
+            from models.demos.gpt_oss.tt.ccl import CCLManager  # noqa: PLC0415
+            from models.demos.gpt_oss.utils.general_utils import get_default_num_links  # noqa: PLC0415
+
+            mesh_config = MeshConfig(
+                mesh_device.shape,
+                decode=ModeConfig(tp=mesh_device.shape[1], ep=mesh_device.shape[0]),
+            )
+            ccl_manager = CCLManager(mesh_device, num_links=get_default_num_links(mesh_device))
+            tp = mesh_device.get_num_devices()
+
         # 48 decoder layers (36 GDN + 12 QSA alternating; PLE folded into layer 1).
         self.layers = [
-            Qwen4ExpDecoderLayer(mesh_device, args, state_dict, i, tensor_cache_path=tensor_cache_path)
+            Qwen4ExpDecoderLayer(
+                mesh_device, args, state_dict, i, tensor_cache_path=tensor_cache_path,
+                ccl_manager=ccl_manager, mesh_config=mesh_config, tp=tp,
+            )
             for i in range(args.num_hidden_layers)
         ]
 
