@@ -26,6 +26,7 @@ def prefill_forward(
     past_key=None,
     past_value=None,
     use_paged_attention=False,
+    layer_debug=None,  # Window G QSA substep capture dict (tt-rd plan §6.13); None = no-op
 ):
     """Dispatch prefill to paged (Branch A) or concat (Branch C) path."""
     if use_paged_attention and chunk_page_table is not None:
@@ -55,6 +56,7 @@ def prefill_forward(
             chunk_page_table=chunk_page_table,
             chunk_start_idx=chunk_start_idx,
             chunk_start_idx_tensor=chunk_start_idx_tensor,
+            layer_debug=layer_debug,
         )
         return output
     else:
@@ -81,5 +83,6 @@ def prefill_forward(
             use_optimized_concat=True,
             memory_config=mc,
             norm_weights_pre_offset=True,
+            layer_debug=layer_debug,
         )
         return output, new_key, new_value
