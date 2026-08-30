@@ -163,6 +163,21 @@ def _get_sdpa_compute_kernel_config():
     )
 
 
+def _replicated_mesh_to_host(mesh_device, t):
+    """Host copy of a mesh-REPLICATED tensor (qwen4_exp model-leg phase-1 layout).
+
+    Plain ttnn.to_torch on a replicate-mapped mesh tensor is TT_FATAL (a mesh
+    composer is required): concat along dim 0 stacks the identical replicas —
+    take the first. Same capture style as the model.py layer_debug precedent
+    (models/tt_transformers/tt/qwen4_exp/model.py::_replicated_mesh_to_host);
+    ttnn is module-level here so it is not a parameter.
+    """
+    if mesh_device is None:
+        return ttnn.to_torch(t)
+    cat = ttnn.to_torch(t, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=0))
+    return cat[: t.shape[0]]
+
+
 def gated_attention_forward_ttnn(
     hidden_states,
     q_proj_weight,
@@ -207,6 +222,11 @@ def gated_attention_forward_ttnn(
     chunk_page_table=None,  # [1, num_blocks_in_chunk] int32 — blocks for this chunk only
     chunk_start_idx=None,  # int — absolute position of this chunk in the full sequence
     chunk_start_idx_tensor=None,  # device tensor [1] int32 — runtime offset for trace-replay (flexible SDPA)
+    # Window G QSA substep debug capture (tt-rd gdn-fidelity plan §6.13): when set
+    # (pcc_device_model.py model leg), named QSA intermediates are copied host-side
+    # into this flat dict — each capture forces a device sync, debug legs only.
+    # Default None = every capture site below is a no-op (zero behavior change).
+    layer_debug=None,
 ):
     """
     TTNN forward pass for Gated Attention with KV cache support.
@@ -229,6 +249,10 @@ def gated_attention_forward_ttnn(
         use_optimized_concat: if True, use ttnn.transformer.concatenate_heads
         past_key: ttnn.Tensor [B, H_kv, S_past, D] or None
         past_value: ttnn.Tensor [B, H_kv, S_past, D] or None
+        layer_debug: optional flat dict (qwen4_exp model-leg Window G); when not
+                     None, 11 named qsa_* substep tensors are captured host-side
+                     (forces a device sync per capture — debug only; no softmax
+                     weights: the fused SDPA does not materialize them)
 
     Returns:
         output: ttnn.Tensor [B, T, hidden_size]
@@ -243,30 +267,42 @@ def gated_attention_forward_ttnn(
     ckc = compute_kernel_config
     qg = ttnn.linear(hidden_states, q_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
     qg = ttnn.reshape(qg, [B, T, num_attention_heads, head_dim * 2])
+    if layer_debug is not None:  # q_proj (2x-wide q||gate) output, pre-split
+        layer_debug["qsa_q_proj_out"] = _replicated_mesh_to_host(device, qg)
     # Split into query and gate
     query_states, gate = ttnn.chunk(qg, 2, dim=-1)
     ttnn.deallocate(qg)
     gate = ttnn.reshape(gate, [B, T, num_attention_heads * head_dim])
+    if layer_debug is not None:  # sigmoid-gate half (pre-sigmoid)
+        layer_debug["qsa_gate"] = _replicated_mesh_to_host(device, gate)
 
     # Q norm + transpose to [B, H_q, T, D]
     if norm_weights_pre_offset:
         query_states = ttnn.rms_norm(query_states, weight=q_norm_weight, epsilon=norm_eps)
     else:
         query_states = rms_norm_zero_centered_ttnn(query_states, q_norm_weight, eps=norm_eps)
+    if layer_debug is not None:  # post-q-RMSNorm (pre-transpose, [B,T,H_q,D])
+        layer_debug["qsa_q_norm_out"] = _replicated_mesh_to_host(device, query_states)
     query_states = ttnn.transpose(query_states, 1, 2)
 
     # K projection + norm + transpose to [B, H_kv, T, D]
     key_states = ttnn.linear(hidden_states, k_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
     key_states = ttnn.reshape(key_states, [B, T, num_key_value_heads, head_dim])
+    if layer_debug is not None:  # k_proj output (pre-norm)
+        layer_debug["qsa_k_proj_out"] = _replicated_mesh_to_host(device, key_states)
     if norm_weights_pre_offset:
         key_states = ttnn.rms_norm(key_states, weight=k_norm_weight, epsilon=norm_eps)
     else:
         key_states = rms_norm_zero_centered_ttnn(key_states, k_norm_weight, eps=norm_eps)
+    if layer_debug is not None:  # post-k-RMSNorm (pre-transpose, [B,T,H_kv,D])
+        layer_debug["qsa_k_norm_out"] = _replicated_mesh_to_host(device, key_states)
     key_states = ttnn.transpose(key_states, 1, 2)
 
     # V projection + transpose to [B, H_kv, T, D]
     value_states = ttnn.linear(hidden_states, v_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
     value_states = ttnn.reshape(value_states, [B, T, num_key_value_heads, head_dim])
+    if layer_debug is not None:  # v_proj output
+        layer_debug["qsa_v_proj_out"] = _replicated_mesh_to_host(device, value_states)
     value_states = ttnn.transpose(value_states, 1, 2)
 
     # RoPE — for decode (T==1), use reshape (metadata-only) instead of unsqueeze (data movement)
@@ -276,6 +312,9 @@ def gated_attention_forward_ttnn(
         query_states, key_states = apply_rotary_pos_emb_ttnn(query_states, key_states, cos_4d, sin_4d)
     else:
         query_states, key_states = apply_rotary_pos_emb_ttnn(query_states, key_states, cos, sin)
+    if layer_debug is not None:  # post-RoPE q/k (new tokens only, pre-KV-cache)
+        layer_debug["qsa_q_rope"] = _replicated_mesh_to_host(device, query_states)
+        layer_debug["qsa_k_rope"] = _replicated_mesh_to_host(device, key_states)
 
     # KV cache handling
     _use_sdpa_decode = False
@@ -554,12 +593,19 @@ def gated_attention_forward_ttnn(
         attn_output = ttnn.transpose(attn_output, 1, 2)
         attn_output = ttnn.reshape(attn_output, [B, T, num_attention_heads * head_dim])
 
+    if layer_debug is not None:  # attention output BEFORE the gate multiply ([B,T,H_q*D])
+        layer_debug["qsa_attn_pre_gate"] = _replicated_mesh_to_host(device, attn_output)
+
     # Apply sigmoid gate
     gate = ttnn.sigmoid(gate)
     attn_output = ttnn.multiply(attn_output, gate)
+    if layer_debug is not None:  # attention output AFTER the gate multiply
+        layer_debug["qsa_attn_post_gate"] = _replicated_mesh_to_host(device, attn_output)
     ttnn.deallocate(gate)
 
     # Output projection
     attn_output = ttnn.linear(attn_output, o_proj_weight, compute_kernel_config=ckc, memory_config=memory_config)
+    if layer_debug is not None:  # o_proj output
+        layer_debug["qsa_o_proj_out"] = _replicated_mesh_to_host(device, attn_output)
 
     return attn_output, new_key, new_value
