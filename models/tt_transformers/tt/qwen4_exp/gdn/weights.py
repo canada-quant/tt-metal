@@ -10,12 +10,20 @@ and every env-var read is preserved verbatim.
 """
 from dataclasses import dataclass
 
+import os
+
 import torch
 
 import ttnn
 from models.tt_transformers.tt.qwen4_exp.gdn.config import GDNConfig
 from models.experimental.gated_attention_gated_deltanet.tt.ttnn_delta_rule_seq import create_chunk_masks_seq
 
+
+# Fidelity-matrix knob (Phase-0, GDN kernel-fidelity plan): QWEN_GDN_WDTYPE=bf16 loads the
+# projection + fused weights as bf16 instead of the shipped bfloat8_b (weights-dtype lever).
+# Default preserves the shipped posture; every other dtype/layout/memory_config verbatim.
+_GDN_WDTYPE = os.environ.get("QWEN_GDN_WDTYPE", "bfp8").strip().lower()
+_GDN_PROJ_DTYPE = ttnn.bfloat16 if _GDN_WDTYPE == "bf16" else _GDN_PROJ_DTYPE
 
 @dataclass
 class GDNWeights:
@@ -117,7 +125,7 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
         t = state_dict[name].T.contiguous()
         return ttnn.as_tensor(
             t,
-            dtype=ttnn.bfloat8_b,
+            dtype=_GDN_PROJ_DTYPE,
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -151,7 +159,7 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
     t = state_dict[qkv_key].T.contiguous()  # [4096, 8192]
     qkv_proj_weight = ttnn.as_tensor(
         t,
-        dtype=ttnn.bfloat8_b,
+        dtype=_GDN_PROJ_DTYPE,
         layout=ttnn.TILE_LAYOUT,
         device=mesh_device,
         memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -249,7 +257,7 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
         a_w = state_dict["in_proj_a.weight"].T.contiguous()  # [4096, 32]
         b_w = state_dict["in_proj_b.weight"].T.contiguous()  # [4096, 32]
         fused = torch.cat([a_w, b_w], dim=1).contiguous()  # [4096, 64]
-        return ttnn.from_torch(fused, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh_device)
+        return ttnn.from_torch(fused, dtype=_GDN_PROJ_DTYPE, layout=ttnn.TILE_LAYOUT, device=mesh_device)
 
     def _precompute_mega_fused_weight():
         """Fuse QKV + a + b + g projections into one [4096, D_total] weight.
@@ -265,7 +273,7 @@ def load_gdn_weights(mesh_device, config: GDNConfig, state_dict, tensor_cache_pa
         b_w = state_dict["in_proj_b.weight"].T.contiguous()  # [4096, 32]
         g_w = state_dict["in_proj_z.weight"].T.contiguous()  # [4096, 4096]
         fused = torch.cat([qkv_w, a_w, b_w, g_w], dim=1).contiguous()
-        return ttnn.from_torch(fused, dtype=ttnn.bfloat8_b, layout=ttnn.TILE_LAYOUT, device=mesh_device)
+        return ttnn.from_torch(fused, dtype=_GDN_PROJ_DTYPE, layout=ttnn.TILE_LAYOUT, device=mesh_device)
 
     # Precompute conv weight taps and bias on device to avoid CPU round-trips during decode
     q_weight_taps = _precompute_weight_taps(q_conv_weight)
