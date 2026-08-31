@@ -31,8 +31,13 @@ REFUSEs to open a device without QWEN4EXP_DEVICE_OK=1 (tt-commandr preemption de
 
 from __future__ import annotations
 
+import os as _os
 from dataclasses import dataclass
 from typing import Any, Optional
+
+# W1 (tt-rd gdn-fidelity plan §7.2): QWEN4EXP_HC_FP32=1 (default OFF — zero
+# behavior change) stages + carries the 10240 stream fp32; see hyper_connections.py.
+_HC_FP32 = _os.environ.get("QWEN4EXP_HC_FP32") == "1"
 
 # --- stdlib-only module constants (host-importable) ---
 # On-disk safetensors prefix, verified verbatim against the checkpoint weight_map
@@ -211,7 +216,13 @@ class Qwen4ExpDecoderLayer:
 
         # 1. PLE residual injection (layer 1 only) — BEFORE the attn gated residual.
         if self.ple is not None and ple_emb is not None:
-            stream = ttnn.add(stream, self.ple.forward(ple_emb, stream))
+            # W1: PLE internals stay bf16 (branch-input downcast); its output is
+            # upcast to fp32 before the fp32 trunk add when the knob is on.
+            ple_in = ttnn.typecast(stream, ttnn.bfloat16) if _HC_FP32 else stream
+            ple_out = self.ple.forward(ple_emb, ple_in)
+            if _HC_FP32:
+                ple_out = ttnn.typecast(ple_out, ttnn.float32)
+            stream = ttnn.add(stream, ple_out)
 
         # 2. attn gated residual: mix_input -> (GDN|QSA)(mixed) -> apply_residual.
         if layer_debug is not None and layer_debug.get("layer") == self.layer_idx:
@@ -402,8 +413,10 @@ class Qwen4ExpModel:
             if mesh_mapper is None:
                 mesh_mapper = ttnn.ReplicateTensorToMesh(self.device)
             stream = ttnn.from_torch(
-                stream_host.to(self._torch_bf16()),
-                dtype=ttnn.bfloat16,
+                # W1: stage fp32 when QWEN4EXP_HC_FP32=1 (embed values are bf16-exact,
+                # so .float() is lossless); default path unchanged.
+                stream_host.float() if _HC_FP32 else stream_host.to(self._torch_bf16()),
+                dtype=ttnn.float32 if _HC_FP32 else ttnn.bfloat16,
                 layout=ttnn.TILE_LAYOUT,
                 device=self.device,
                 mesh_mapper=mesh_mapper,
