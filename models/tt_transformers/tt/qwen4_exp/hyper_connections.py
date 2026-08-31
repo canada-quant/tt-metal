@@ -27,6 +27,7 @@ imports this package before devices are up). ttnn resolves lazily in
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -35,6 +36,20 @@ HIDDEN = 2560  # config hidden_size
 LOWRANK = 320  # config hc_lowrank
 EPS = 1e-06  # rms_norm_eps (config.json, verified in capture_hc.py)
 MIX_SCALE = 1.0 / HC_COUNT  # HF divides by hc_count BEFORE silu / sigmoid — power of two, bf16-exact
+
+# W1 (tt-rd gdn-fidelity plan §7.2 — fp32 hyper-connection stream carry):
+# QWEN4EXP_HC_FP32=1 (default OFF — zero behavior change) carries the 10240-wide
+# stream fp32 across the 96 HC boundaries (48 layers × attn/mlp). Branch inputs are
+# downcast to bf16 at mix_input entry (HF cast points unchanged: hf normed/mixed/inj
+# are bf16 — modeling_qwen4_exp.py L173-177, L952-972) and block outputs are upcast
+# to fp32 in apply_residual, so the residual SUM is never re-rounded bf16 per
+# boundary. fp32 ops touched: ttnn.add / ttnn.multiply / ttnn.typecast — first-class
+# fp32 TILE on this image (binary.cpp:516-530; typecast = the proven qwen36 gdn
+# pattern). Root cause: full-chain PCC 0.99333996 deterministic ×4 with the loss
+# driven by MoE router near-tie flips on the inherited ~1e-2 stream-noise band
+# (Window H); W4/W2 proved the flips are NOT router-local — the noise arrives
+# inherited in the stream, and 96 bf16 boundary roundings compound it.
+_HC_FP32 = os.environ.get("QWEN4EXP_HC_FP32") == "1"
 
 
 def _ttnn():
@@ -138,6 +153,10 @@ class HyperConnection:
         """
         ttnn = _ttnn()
         w = self.weights
+        if _HC_FP32 and x_stream.dtype == ttnn.float32:
+            # W1: downcast the branch input at the HC boundary — the hf mix path
+            # (normed / gates / mixed / inj) is bf16; cast points unchanged.
+            x_stream = ttnn.typecast(x_stream, ttnn.bfloat16)
         normed, normed4 = self._grouped_rms_norm(ttnn, x_stream)
 
         mix_w = ttnn.linear(normed, w.down, compute_kernel_config=self.compute_kernel_config)
@@ -167,6 +186,13 @@ class HyperConnection:
         ttnn = _ttnn()
         if not self.has_inject or injection is None:
             raise ValueError("apply_residual requires a block HC (has_inject=True) and its injection tensor")
+        if _HC_FP32:
+            # W1: upcast block output + injection to fp32 and keep the residual SUM
+            # fp32 — the stream is never re-rounded bf16 at an HC boundary.
+            if x_stream.dtype != ttnn.float32:
+                x_stream = ttnn.typecast(x_stream, ttnn.float32)
+            block_out = ttnn.typecast(block_out, ttnn.float32)
+            injection = ttnn.typecast(injection, ttnn.float32)
         lead = list(x_stream.shape)[:-1]
         b4 = ttnn.unsqueeze(block_out, -2)  # (…,1,2560)
         i4 = ttnn.unsqueeze(injection, -1)  # (…,4,1)
