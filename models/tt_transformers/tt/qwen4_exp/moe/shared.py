@@ -18,6 +18,7 @@ caller together with the routed-expert reduction's all-reduce).
 
 import ttnn
 
+from .experts import EXPERT_HIFI_COMPUTE_CONFIG  # T1+T7 knob (owner-approved 2026-08-31)
 from .weights import SharedExpertWeights
 
 
@@ -32,14 +33,33 @@ def shared_expert_forward(hidden_states, weights: SharedExpertWeights, config):
     Returns:
         ttnn [..., hidden_size] — sigmoid(gate(x)) * shared(x), pre-all-reduce.
     """
-    gate = ttnn.linear(hidden_states, weights.gate_proj, memory_config=ttnn.L1_MEMORY_CONFIG)
-    up = ttnn.linear(hidden_states, weights.up_proj, memory_config=ttnn.L1_MEMORY_CONFIG)
+    # T7: same owner-approved HiFi knob as the routed experts (moe/experts.py) — this
+    # dense path runs for EVERY token. The sigmoid gate scalar below (bf16 x bf16, no
+    # program config) already defaults to HiFi2 via the increase_fidelity path, so it
+    # is deliberately NOT overridden.
+    gate = ttnn.linear(
+        hidden_states,
+        weights.gate_proj,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+        compute_kernel_config=EXPERT_HIFI_COMPUTE_CONFIG,
+    )
+    up = ttnn.linear(
+        hidden_states,
+        weights.up_proj,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+        compute_kernel_config=EXPERT_HIFI_COMPUTE_CONFIG,
+    )
     gate_act = ttnn.silu(gate)
     ttnn.deallocate(gate)
     hidden = ttnn.mul(gate_act, up)
     ttnn.deallocate(gate_act)
     ttnn.deallocate(up)
-    shared = ttnn.linear(hidden, weights.down_proj, memory_config=ttnn.L1_MEMORY_CONFIG)
+    shared = ttnn.linear(
+        hidden,
+        weights.down_proj,
+        memory_config=ttnn.L1_MEMORY_CONFIG,
+        compute_kernel_config=EXPERT_HIFI_COMPUTE_CONFIG,
+    )
     ttnn.deallocate(hidden)
 
     gate_scalar = ttnn.linear(
