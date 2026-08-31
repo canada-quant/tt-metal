@@ -106,6 +106,31 @@ class Qwen4ExpRouter:
             if (self.router_fp32 and mesh_device is not None)
             else None
         )
+        # QWEN4EXP_TOPK_STABLE (pre-staged 2026-08-31; tt-rd gdn-fidelity plan
+        # §7.11): env-guarded deterministic near-tie break at the top-10 — see
+        # __call__ step 2 and _stable_bias. Default off = zero behavior change.
+        self.topk_stable = os.environ.get("QWEN4EXP_TOPK_STABLE", "0") == "1"
+        self._stable_bias_t = None
+
+    def _stable_bias(self):
+        """Cached fp32 [1, 512] index-priority epsilon ramp on device
+        (QWEN4EXP_TOPK_STABLE): bias_i = i * 2e-9. Built lazily, once, via
+        torch -> ttnn.from_torch with the same replicate-mesh mapping and
+        TILE layout as the router weight, so ttnn.subtract broadcasts it
+        across the [tokens, 512] probs tensor."""
+        if self._stable_bias_t is None:
+            import torch
+
+            ramp = (torch.arange(self.num_experts, dtype=torch.float32) * 2e-9).reshape(1, -1)
+            self._stable_bias_t = ttnn.from_torch(
+                ramp,
+                dtype=ttnn.float32,
+                layout=ttnn.TILE_LAYOUT,
+                device=self.mesh_device,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device) if self.mesh_device is not None else None,
+            )
+        return self._stable_bias_t
 
     @staticmethod
     def _cache_name(tensor_cache_path, name):
@@ -138,6 +163,12 @@ class Qwen4ExpRouter:
                 renorm -> scatter) runs in fp32 at the HF cast points; the
                 rw512 return stays bf16 (expert-combine input unchanged).
                 Unset = zero behavior change.
+                QWEN4EXP_TOPK_STABLE=1 (pre-staged 2026-08-31, §7.11): an fp32
+                index-priority epsilon ramp (i * 2e-9) is subtracted from the
+                softmax probabilities BEFORE the top-10, making near-tie
+                selection a deterministic function of expert id (root cause:
+                MoE router near-tie chaotic amplification, §7.9). Default off
+                = zero behavior change.
 
         Returns:
             (expert_indices, routing_weights_512):
@@ -180,8 +211,34 @@ class Qwen4ExpRouter:
         ttnn.deallocate(router_logits)
 
         # 2) top-10 of the probabilities (sorted so weights/indices align).
+        if self.topk_stable:
+            # QWEN4EXP_TOPK_STABLE=1 (pre-staged 2026-08-31; default off = zero
+            # behavior change): deterministic near-tie break — subtract an
+            # index-priority epsilon ramp from the probabilities BEFORE topk,
+            # in fp32:
+            #     prob'_i = prob_i - i * 2e-9     (span over 512 experts ~1e-6)
+            # The span sits below any meaningful softmax gap but above fp32
+            # exact-tie noise, so selection among experts tied at the numeric
+            # floor becomes a deterministic function of expert id (lower id
+            # wins) — removing kernel-config/dtype-path dependence of the
+            # routing DECISION itself (root cause: MoE router near-tie chaotic
+            # amplification, tt-rd gdn-fidelity plan §7.2/§7.9). fp32 only: the
+            # ramp is far below bf16 ULP, so a bf16 subtraction would be a
+            # silent no-op. Applied post-softmax/pre-topk — the spec §2 order
+            # (softmax-all-512 -> top-10) is preserved.
+            src_t = probs
+            biased_in = src_t if self.router_fp32 else ttnn.typecast(src_t, ttnn.float32)
+            biased = ttnn.subtract(biased_in, self._stable_bias())
+            ttnn.deallocate(src_t)
+            if biased_in is not src_t:
+                ttnn.deallocate(biased_in)
+            probs = biased
         top_w, top_i = ttnn.topk(probs, k=self.top_k, dim=-1, sorted=True)
         ttnn.deallocate(probs)
+        if self.topk_stable and not self.router_fp32:
+            # restore the downstream bf16 contract (top_w feeds the renorm and
+            # the bf16-only scatter machinery — see the zeros comment above)
+            top_w = ttnn.typecast(top_w, ttnn.bfloat16)
         if layer_debug is not None:  # Window H: host-capture top-10 expert indices
             layer_debug.setdefault("moe_router_indices", []).append(
                 _replicated_mesh_to_host(self.mesh_device, top_i)
