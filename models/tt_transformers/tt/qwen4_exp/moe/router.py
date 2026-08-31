@@ -102,6 +102,13 @@ class Qwen4ExpRouter:
                 top-10 expert indices are host-captured (list-appended per call —
                 the seq>1 MoE loop fires this router once per token). Default None
                 = zero behavior change on every production path.
+                W4 (tt-rd gdn-fidelity plan §7.2): when layer_debug carries a
+                "force_router_indices" list, each call pops one [1,10] HF ref
+                index set and routes to it INSTEAD of the computed top_i (gate
+                weights stay device-computed — indices only are forced), the
+                teacher-forced routing diagnostic isolating continuous math from
+                routing divergence. Absent/empty list = computed indices (zero
+                behavior change).
 
         Returns:
             (expert_indices, routing_weights_512):
@@ -144,6 +151,23 @@ class Qwen4ExpRouter:
             layer_debug.setdefault("moe_router_indices", []).append(
                 _replicated_mesh_to_host(self.mesh_device, top_i)
             )
+        force_q = layer_debug.get("force_router_indices") if layer_debug is not None else None
+        if force_q:  # W4: teacher-forced routing — swap in the HF ref indices
+            # for this token (popped in slot order; the computed indices were
+            # host-captured above, so the harness still measures computed-vs-ref
+            # Jaccard in a force leg). Mirror the live top_i tensor properties
+            # (0.19-era getters, defensive fallbacks).
+            forced = force_q.pop(0)
+            fi_dev = ttnn.from_torch(
+                forced,  # torch [1,10] int (harness slices hc{L} moe_router_indices)
+                dtype=top_i.get_dtype() if hasattr(top_i, "get_dtype") else ttnn.uint32,
+                layout=top_i.get_layout() if hasattr(top_i, "get_layout") else ttnn.TILE_LAYOUT,
+                device=self.mesh_device,
+                memory_config=top_i.memory_config() if hasattr(top_i, "memory_config") else ttnn.DRAM_MEMORY_CONFIG,
+                mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device) if self.mesh_device is not None else None,
+            )
+            ttnn.deallocate(top_i)
+            top_i = fi_dev
 
         # 3) L1 renorm (norm_topk_prob=True): w_i / sum_j w_j over the 10 selected.
         denom = ttnn.sum(top_w, dim=-1, keepdim=True)
