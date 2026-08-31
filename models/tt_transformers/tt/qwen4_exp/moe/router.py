@@ -19,6 +19,8 @@ Router weight: (512, 2560) bf16, NO bias (module_map.txt: `mlp.gate.weight` only
 Transposed to (2560, 512) for ttnn.linear; replicated across the mesh (2.6 MB/layer).
 """
 
+import os
+
 import ttnn
 
 
@@ -83,6 +85,27 @@ class Qwen4ExpRouter:
             if mesh_device is not None
             else None
         )
+        # W2 (tt-rd gdn-fidelity plan §7.2): env-guarded fp32 router path.
+        # When set, the router GEMM accumulates in fp32 (fp32_dest_acc_en) and
+        # the softmax->topk->renorm->scatter decision path runs in fp32 —
+        # matching the HF cast points (modeling_qwen4_exp.py L909–911: bf16
+        # logits -> softmax(dtype=float)); the bf16 out tile after the GEMM IS
+        # the HF cast point, so we upcast with typecast (proven op on this
+        # image: qwen36 gdn fused_chunk.py:174) rather than an fp32 out tile.
+        # Default off = zero behavior change (compute_kernel_config=None is
+        # the ttnn.linear default).
+        self.router_fp32 = os.environ.get("QWEN4EXP_ROUTER_FP32", "0") == "1"
+        self.router_linear_compute_config = (
+            ttnn.init_device_compute_kernel_config(
+                mesh_device.arch(),
+                math_fidelity=ttnn.MathFidelity.HiFi4,
+                math_approx_mode=False,
+                fp32_dest_acc_en=True,
+                packer_l1_acc=False,
+            )
+            if (self.router_fp32 and mesh_device is not None)
+            else None
+        )
 
     @staticmethod
     def _cache_name(tensor_cache_path, name):
@@ -109,6 +132,12 @@ class Qwen4ExpRouter:
                 teacher-forced routing diagnostic isolating continuous math from
                 routing divergence. Absent/empty list = computed indices (zero
                 behavior change).
+                W2 (tt-rd gdn-fidelity plan §7.2): when the env knob
+                QWEN4EXP_ROUTER_FP32=1 is set at load time, the router GEMM
+                accumulates in fp32 and the decision path (softmax -> topk ->
+                renorm -> scatter) runs in fp32 at the HF cast points; the
+                rw512 return stays bf16 (expert-combine input unchanged).
+                Unset = zero behavior change.
 
         Returns:
             (expert_indices, routing_weights_512):
@@ -125,8 +154,12 @@ class Qwen4ExpRouter:
             hidden_states,
             self.weight,
             memory_config=mem_config,
+            compute_kernel_config=self.router_linear_compute_config,
         )
-        if layer_debug is not None:  # Window H: host-capture bf16 router logits
+        if self.router_fp32:  # W2: fp32 decision path from the softmax onward
+            # (bf16 out tile == HF cast point; typecast upcasts the tile).
+            router_logits = ttnn.typecast(router_logits, ttnn.float32)
+        if layer_debug is not None:  # Window H: host-capture router logits (bf16; fp32 under the W2 knob)
             layer_debug.setdefault("moe_router_logits", []).append(
                 _replicated_mesh_to_host(self.mesh_device, router_logits)
             )
@@ -177,4 +210,9 @@ class Qwen4ExpRouter:
         # 4) scatter back to the 512-wide sparse routing vector (sparse_matmul input).
         routing_weights_512 = ttnn.scatter(zeros, dim=1, index=top_i, src=top_w)
         ttnn.deallocate(zeros)
+        if self.router_fp32:  # W2 expert-combine dtype audit: keep the rw512
+            # return contract bf16 — the sparse_matmul sparsity input dtype is
+            # UNCHANGED in this leg (single-variable experiment: router
+            # decision precision only; expert-math precision is W1's lever).
+            routing_weights_512 = ttnn.typecast(routing_weights_512, ttnn.bfloat16)
         return top_i, routing_weights_512
