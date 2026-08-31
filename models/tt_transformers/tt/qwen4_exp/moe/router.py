@@ -156,9 +156,6 @@ class Qwen4ExpRouter:
             memory_config=mem_config,
             compute_kernel_config=self.router_linear_compute_config,
         )
-        if self.router_fp32:  # W2: fp32 decision path from the softmax onward
-            # (bf16 out tile == HF cast point; typecast upcasts the tile).
-            router_logits = ttnn.typecast(router_logits, ttnn.float32)
         if layer_debug is not None:  # Window H: host-capture router logits (bf16; fp32 under the W2 knob)
             layer_debug.setdefault("moe_router_logits", []).append(
                 _replicated_mesh_to_host(self.mesh_device, router_logits)
@@ -166,7 +163,12 @@ class Qwen4ExpRouter:
 
         # Pre-allocate the 512-wide zeros vector for the scatter BEFORE freeing
         # router_logits (gpt_oss topk.py: ttnn.scatter(ttnn.zeros_like(g), ...)).
-        zeros = ttnn.zeros_like(router_logits)
+        zeros = ttnn.zeros_like(router_logits)  # bf16 ALWAYS (created pre-typecast):
+        # ttnn.scatter TT_FATALs on fp32 TILE input (scatter.cpp:109; hit by the
+        # first W2 leg 2026-08-31 02:28:29Z) — the scatter machinery stays bf16.
+        if self.router_fp32:  # W2: fp32 decision path from the softmax onward
+            # (bf16 out tile == HF cast point; typecast upcasts the tile).
+            router_logits = ttnn.typecast(router_logits, ttnn.float32)
 
         # 1) softmax over ALL 512 experts, fp32 accumulation — BEFORE topk.
         probs = ttnn.softmax(
@@ -208,11 +210,12 @@ class Qwen4ExpRouter:
         ttnn.deallocate(denom)
 
         # 4) scatter back to the 512-wide sparse routing vector (sparse_matmul input).
+        if self.router_fp32:  # W2 expert-combine dtype audit: cast the renormed
+            # weights back to bf16 for the scatter (fp32 TILE unsupported there)
+            # — rw512 keeps its bf16 contract, the sparse_matmul sparsity input
+            # dtype is UNCHANGED (single-variable experiment: router decision
+            # precision only; expert-math precision is W1's lever).
+            top_w = ttnn.typecast(top_w, ttnn.bfloat16)
         routing_weights_512 = ttnn.scatter(zeros, dim=1, index=top_i, src=top_w)
         ttnn.deallocate(zeros)
-        if self.router_fp32:  # W2 expert-combine dtype audit: keep the rw512
-            # return contract bf16 — the sparse_matmul sparsity input dtype is
-            # UNCHANGED in this leg (single-variable experiment: router
-            # decision precision only; expert-math precision is W1's lever).
-            routing_weights_512 = ttnn.typecast(routing_weights_512, ttnn.bfloat16)
         return top_i, routing_weights_512
