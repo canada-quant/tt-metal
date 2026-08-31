@@ -23,10 +23,41 @@ snap-to-divisor and out_subblock_w<=8 discipline verbatim; defaults are the
 starting point for the device leg (tuning is a P4-device item).
 """
 
+import os
+
 import ttnn
 from models.demos.gpt_oss.tt.experts.config import ProgramConfig
 
 from .weights import ExpertWeights
+
+# QWEN4EXP_EXPERT_HIFI (owner-approved T1+T7 window 2026-08-31; tt-rd gdn-fidelity
+# plan section 7.14): "4" = HiFi4 + fp32 dest acc, "2" = HiFi2 + fp32 dest acc, applied
+# to the three routed-expert sparse_matmuls here AND the shared-expert SwiGLU linears
+# in moe/shared.py. Default off = zero behavior change (compute_kernel_config=None).
+#
+# Root cause (plan section 7.8.1): with NO explicit compute_kernel_config the matmul
+# default resolution forces LoFi whenever inputs are BFP4/BFP8 OR a program_config is
+# passed (ttnn/cpp/ttnn/operations/matmul/device/matmul_device_operation.cpp
+# create_matmul_attributes: increase_fidelity = !has_program_config && !has_user_grid
+# && !are_inputs_low_precision_df; math_fidelity = increase ? HiFi2 : LoFi). All three
+# expert matmuls hit BOTH conditions (BFP4/BFP8 weights + explicit gpt_oss
+# ProgramConfig), so they run LoFi today — LoFi fully consumes the BFP4/BFP8 WEIGHTS
+# but truncates bf16 ACTIVATION inputs to ~5 mantissa bits. fp32_dest_acc_en is
+# supported by the sparse_matmul factory (FP32_DEST_ACC_EN define); the HiFi4+fp32acc
+# hardware bug #38306 is Wormhole-only (we are Blackhole). compute_kernel_config is
+# exposed on ttnn.sparse_matmul (matmul_nanobind.cpp bind_function<"sparse_matmul">,
+# optional, None default).
+_EXPERT_HIFI = os.environ.get("QWEN4EXP_EXPERT_HIFI", "0")
+if _EXPERT_HIFI not in ("0", "2", "4"):
+    raise ValueError(f"QWEN4EXP_EXPERT_HIFI must be one of 0/2/4, got {_EXPERT_HIFI!r}")
+EXPERT_HIFI_COMPUTE_CONFIG = None
+if _EXPERT_HIFI != "0":
+    EXPERT_HIFI_COMPUTE_CONFIG = ttnn.WormholeComputeKernelConfig(
+        math_fidelity=ttnn.MathFidelity.HiFi4 if _EXPERT_HIFI == "4" else ttnn.MathFidelity.HiFi2,
+        math_approx_mode=False,
+        fp32_dest_acc_en=True,
+        packer_l1_acc=True,
+    )
 
 
 def experts_decode_forward(
@@ -90,6 +121,7 @@ def experts_decode_forward(
         program_config=program_config.get_decode_gate_up_config(
             hidden_states.shape[2], weights.gate_proj.shape[3], k=hidden_states.shape[-1]
         ),
+        compute_kernel_config=EXPERT_HIFI_COMPUTE_CONFIG,
         dtype=activation_dtype,
     )
     gate = ttnn.reshape(gate, (batch_size, config.num_experts, 1, weights.intermediate_size_per_device))
@@ -107,6 +139,7 @@ def experts_decode_forward(
         program_config=program_config.get_decode_gate_up_config(
             hidden_states.shape[2], weights.up_proj.shape[3], k=hidden_states.shape[-1]
         ),
+        compute_kernel_config=EXPERT_HIFI_COMPUTE_CONFIG,
         dtype=activation_dtype,
     )
     # NOTE: do NOT deallocate hidden_states here — it is the CALLER's tensor
@@ -139,6 +172,7 @@ def experts_decode_forward(
         program_config=program_config.get_decode_down_config(
             down_input.shape[2], weights.down_proj.shape[-1], k=down_input.shape[-1]
         ),
+        compute_kernel_config=EXPERT_HIFI_COMPUTE_CONFIG,
         dtype=activation_dtype,
     )
     down_input.deallocate(True)
